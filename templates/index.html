@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>商业计划书脱敏详情图生成工具</title>
+    <link rel="icon" href="{{ url_for('favicon') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>商业计划书 / 可研报告脱敏详情图生成工具</h1>
+          <p>本地处理 PDF、DOCX、DOC，输出马赛克图片化脱敏 PDF、分页图片、ZIP 和 JSON 报告。</p>
+        </div>
+      </header>
+
+      <nav class="feature-tabs" aria-label="功能切换">
+        <button type="button" class="is-active" data-tab="pdf">PDF/Word 脱敏详情图</button>
+        <button type="button" data-tab="excel">Excel 客户预览版</button>
+      </nav>
+
+      <section id="pdfPanel" class="feature-panel is-active">
+      <section class="panel">
+        <div class="warning">
+          自动脱敏可能存在漏识别。用于客户资料或公开展示前，请务必逐页预览，必要时使用手动框选补充遮挡。
+        </div>
+        <div class="flow-note">
+          <strong>推荐：先用 WPS/Word 导出 PDF，再上传本工具，可最大程度保持原排版。</strong>
+          <ol>
+            <li>如果是 Word 文件，请先在 WPS/Word 中导出 PDF；</li>
+            <li>再上传 PDF 到本工具；</li>
+            <li>工具会在不改变页数和排版的基础上生成脱敏 PDF 和分页详情图。</li>
+          </ol>
+          <p>为避免 Word 转 PDF 后行距、分页变化，建议先用 WPS/Word 手动导出 PDF，再上传 PDF 脱敏。直接上传 DOCX/DOC 会调用 LibreOffice 自动转换，可能导致页数、行距、表格和分页变化。</p>
+        </div>
+        <div class="settings-row">
+          <label>
+            详情图默认遮挡方式
+            <select id="defaultMaskMethod">
+              <option value="mosaic" selected>马赛克</option>
+              <option value="gray_mosaic">浅灰马赛克</option>
+              <option value="blur">模糊</option>
+              <option value="black_box">黑块</option>
+            </select>
+          </label>
+          <label>
+            原文件预计页数（可选）
+            <input id="expectedPages" class="number-input" type="number" min="1" step="1" placeholder="例如 56">
+          </label>
+        </div>
+        <div id="dropzone" class="dropzone">
+          <input id="fileInput" type="file" accept=".pdf,.docx,.doc" multiple>
+          <div class="drop-title">拖拽文件到这里，或点击选择文件</div>
+          <div class="drop-subtitle">支持批量处理，文件不会上传到外部接口。</div>
+        </div>
+        <div class="actions">
+          <button id="processBtn" class="primary" disabled>开始处理</button>
+          <button id="clearBtn" class="ghost" disabled>清空列表</button>
+          <span id="statusText"></span>
+        </div>
+        <ul id="fileList" class="file-list"></ul>
+      </section>
+
+      <section id="errors" class="errors" hidden></section>
+      <section id="results" class="results"></section>
+      </section>
+
+      <section id="excelPanel" class="feature-panel">
+        <section class="panel">
+          <div class="warning">
+            该功能用于生成客户预览版 Excel：不设置打开密码，可直接打开浏览；会尽量将公式转为数值、添加水印并锁定工作表。工作表保护不是强加密，不能替代正式保密协议或文件级加密。
+          </div>
+          <div class="excel-layout">
+            <div>
+              <div id="excelDropzone" class="dropzone">
+                <input id="excelFileInput" type="file" accept=".xlsx,.xlsm,.xls">
+                <div class="drop-title">拖拽 Excel 到这里，或点击选择文件</div>
+                <div class="drop-subtitle">支持 .xlsx、.xlsm；.xls 请先另存为 .xlsx 后处理。</div>
+              </div>
+              <ul id="excelFileList" class="file-list"></ul>
+              <div class="excel-workbook-tools">
+                <label>
+                  预览工作表
+                  <select id="excelSheetSelect" disabled>
+                    <option value="">请先上传 Excel</option>
+                  </select>
+                </label>
+                <label>
+                  预览范围
+                  <select id="excelPreviewRange" disabled>
+                    <option value="auto" selected>自动：打印区域优先，否则已使用区域</option>
+                    <option value="used_range">当前工作表已使用区域</option>
+                    <option value="print_area">当前工作表打印区域，如果有</option>
+                  </select>
+                </label>
+                <div class="actions">
+                  <button id="excelPreviewBtn" type="button" class="ghost" disabled>生成水印预览图</button>
+                  <button id="excelRefreshPreviewBtn" type="button" class="ghost" disabled>刷新预览</button>
+                </div>
+                <div id="excelPreviewStatus" class="hint"></div>
+              </div>
+            </div>
+            <div class="excel-settings">
+              <label>
+                预览安全模式
+                <select id="excelSecurityMode">
+                  <option value="image_based" selected>图片化防复制版 Excel</option>
+                  <option value="locked_excel">普通锁定版 Excel</option>
+                </select>
+              </label>
+              <div class="mode-help">
+                <p><strong>图片化防复制版：</strong>适合发客户看样式和大概内容。每个工作表会转成图片放入 Excel，客户不能直接复制单元格数据，但仍可能截图或 OCR。</p>
+                <p><strong>普通锁定版：</strong>适合需要保留真实单元格结构的预览。可保护工作表和公式转值，但客户仍可能复制单元格内容。</p>
+              </div>
+              <label>
+                水印文字
+                <input id="excelWatermarkText" type="text" value="保密文件">
+              </label>
+              <div class="settings-grid">
+                <label>
+                  字体大小
+                  <input id="excelWatermarkFontSize" type="number" min="12" max="80" value="28">
+                </label>
+                <label>
+                  颜色
+                  <input id="excelWatermarkColor" type="color" value="#b8b8b8">
+                </label>
+                <label>
+                  透明度
+                  <input id="excelWatermarkOpacity" type="number" min="5" max="80" value="20">
+                </label>
+                <label>
+                  旋转角度
+                  <input id="excelWatermarkRotation" type="number" min="-90" max="90" value="-30">
+                </label>
+                <label>
+                  平铺间距
+                  <select id="excelWatermarkSpacing">
+                    <option value="compact">紧凑</option>
+                    <option value="medium" selected>中等</option>
+                    <option value="wide">宽松</option>
+                  </select>
+                </label>
+                <label>
+                  编辑/保护密码
+                  <input id="excelProtectionPassword" type="text" value="123456">
+                </label>
+              </div>
+              <div class="toggle-grid">
+                <label><input id="excelConvertFormulas" type="checkbox" checked> 公式转数值</label>
+                <label><input id="excelAddWatermark" type="checkbox" checked> 添加水印</label>
+                <label><input id="excelProtectSheets" type="checkbox" checked> 保护工作表</label>
+                <label><input id="excelProtectWorkbook" type="checkbox" checked> 保护工作簿结构</label>
+                <label><input id="excelIncludeHidden" type="checkbox"> 处理隐藏工作表</label>
+              </div>
+              <div id="excelFormulaModeHint" class="hint">图片化防复制版会直接截图当前显示效果，不需要公式转数值。</div>
+              <div class="actions">
+                <button id="excelProcessBtn" class="primary" disabled>生成预览版 Excel</button>
+                <span id="excelStatusText"></span>
+              </div>
+            </div>
+          </div>
+          <div class="excel-preview-panel">
+            <div class="excel-preview-header">
+              <div>
+                <strong>水印效果预览</strong>
+                <p>只预览当前选中的工作表，不生成最终 Excel。</p>
+              </div>
+              <div class="excel-preview-controls">
+                <button id="excelPreviewFitBtn" type="button" class="ghost" disabled>适应宽度</button>
+                <button id="excelPreviewOriginalBtn" type="button" class="ghost" disabled>原始大小</button>
+                <button id="excelPreviewZoomInBtn" type="button" class="ghost" disabled>放大</button>
+                <button id="excelPreviewZoomOutBtn" type="button" class="ghost" disabled>缩小</button>
+              </div>
+            </div>
+            <div id="excelPreviewStage" class="excel-preview-stage">
+              <div id="excelPreviewPlaceholder" class="excel-preview-placeholder">上传 Excel 后，选择工作表并点击“生成水印预览图”。</div>
+              <img id="excelPreviewImage" alt="Excel 水印效果预览" hidden>
+            </div>
+          </div>
+        </section>
+        <section id="excelErrors" class="errors" hidden></section>
+        <section id="excelResults" class="results"></section>
+      </section>
+    </main>
+
+    <div id="previewModal" class="modal" hidden>
+      <div class="modal-body">
+        <div class="modal-toolbar">
+          <strong id="previewTitle">页面预览</strong>
+          <span class="manual-tip">操作方法：先在页面上拖拽框选区域，再点击添加遮挡。</span>
+          <label>
+            遮挡方式
+            <select id="maskMethod">
+              <option value="mosaic" selected>马赛克</option>
+              <option value="gray_mosaic">浅灰马赛克</option>
+              <option value="blur">模糊</option>
+              <option value="black_box">黑块</option>
+            </select>
+          </label>
+          <button id="submitManualBtn" class="primary">添加遮挡</button>
+          <button id="undoPageMaskBtn" class="ghost">撤销上一处</button>
+          <button id="clearPageMasksBtn" class="ghost">清空本页</button>
+          <button id="closeModalBtn" class="ghost">关闭</button>
+        </div>
+        <div id="manualStatus" class="manual-status" hidden></div>
+        <div class="preview-stage">
+          <img id="previewImage" alt="页面预览">
+          <canvas id="selectionCanvas"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
