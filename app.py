@@ -58,6 +58,10 @@ def with_excel_urls(report: dict) -> dict:
         for key, value in outputs.items()
         if key in {"excel", "report"} and value
     }
+    if outputs.get("excel"):
+        decorated["excel_download_url"] = url_for("output_file", name=f"{job_id}/{outputs['excel']}")
+    if outputs.get("report"):
+        decorated["report_download_url"] = url_for("output_file", name=f"{job_id}/{outputs['report']}")
     return decorated
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import time
 import warnings
 from dataclasses import dataclass
@@ -36,6 +37,7 @@ SPACING_FACTORS = {
     "medium": (1.35, 145),
     "wide": (1.85, 210),
 }
+OFFICE_PROCESS_NAMES = {"excel", "et", "wps", "wpp"}
 REAL_SCREENSHOT_FAILURE_MESSAGE = (
     "真实截图失败，未生成图片化防复制版 Excel。当前环境无法通过 Excel/WPS COM 获取工作表原样截图。"
     "请尝试：1）关闭所有 WPS/Excel 进程后重试；2）用 WPS/Excel 打开原文件并另存为 xlsx；"
@@ -64,6 +66,8 @@ class ExcelPreviewOptions:
     image_range_type: str = "auto"
     allow_approximate_fallback: bool = False
     output_mode: str = "desktop"
+    output_report_to_desktop: bool = False
+    screenshot_window_mode: str = "quiet"
 
 
 def process_excel_preview(
@@ -93,8 +97,11 @@ def process_excel_preview(
     save_func(input_path)
 
     output_suffix = ".xlsx" if options.preview_security_mode == "image_based" else suffix
-    output_excel = job_dir / f"{output_stem}{output_suffix}"
-    report_path = job_dir / f"{output_stem}_处理报告.json"
+    desktop_dir = find_windows_desktop() if options.output_mode == "desktop" else None
+    output_version_number = choose_output_version(output_root, desktop_dir, output_stem, output_suffix)
+    versioned_stem = versioned_output_stem(output_stem, output_version_number)
+    output_excel = job_dir / f"{versioned_stem}{output_suffix}"
+    report_path = job_dir / f"{versioned_stem}_处理报告.json"
 
     warnings: list[str] = []
     errors: list[str] = []
@@ -117,6 +124,12 @@ def process_excel_preview(
             "job_id": job_id,
             "source_file": original_name,
             "output_excel": output_excel.name,
+            "output_filename": output_excel.name,
+            "report_filename": report_path.name,
+            "output_version": f"v{output_version_number}",
+            "overwrite_existing": False,
+            "excel_download_url": f"/outputs/{job_id}/{output_excel.name}",
+            "report_download_url": f"/outputs/{job_id}/{report_path.name}",
             "outputs": {
                 "excel": output_excel.name,
                 "report": report_path.name,
@@ -129,7 +142,7 @@ def process_excel_preview(
             "local_only": True,
         }
     )
-    prepare_excel_output_location(report, output_excel, report_path, options)
+    prepare_excel_output_location(report, output_excel, report_path, options, desktop_dir=desktop_dir)
     write_json(report_path, report)
     finalize_report_output_copy(report, report_path)
     write_json(report_path, report)
@@ -183,53 +196,71 @@ def process_excel_preview_from_upload(
     return process_excel_preview(upload_meta["original_name"], save_func, output_root, options=options, progress_callback=progress_callback)
 
 
-def prepare_excel_output_location(report: dict, output_excel: Path, report_path: Path, options: ExcelPreviewOptions):
+def prepare_excel_output_location(report: dict, output_excel: Path, report_path: Path, options: ExcelPreviewOptions, desktop_dir: Path | None = None):
     app_output_path = Path(output_excel).resolve()
     app_report_path = Path(report_path).resolve()
     report.update(
         {
             "output_mode": options.output_mode,
+            "excel_output_path": str(app_output_path),
+            "report_output_path": str(app_report_path),
+            "excel_desktop_path": None,
+            "report_desktop_path": None,
+            "desktop_excel_copied": False,
+            "desktop_report_copied": False,
             "app_output_path": str(app_output_path),
             "app_report_path": str(app_report_path),
             "desktop_output_enabled": options.output_mode == "desktop",
             "desktop_output_path": "",
-            "desktop_report_path": "",
-            "actual_save_location": str(app_output_path.parent),
+            "desktop_report_path": None,
+            "actual_save_location": str(app_output_path),
+            "report_location": "程序 output 目录，可点击“下载处理报告 JSON”查看。",
             "output_copy_status": "app_output_only",
         }
     )
     if options.output_mode != "desktop":
         return
 
-    desktop_dir = find_windows_desktop()
+    desktop_dir = desktop_dir or find_windows_desktop()
     if not desktop_dir:
         report["output_copy_status"] = "desktop_not_found_fallback_app_output"
-        report.setdefault("warnings", []).append("桌面输出失败，已保存在程序 output 目录。")
+        report.setdefault("warnings", []).append(f"桌面输出失败，已保存在程序 output 目录：{app_output_path}")
         return
 
     try:
         desktop_dir.mkdir(parents=True, exist_ok=True)
         desktop_excel = desktop_dir / output_excel.name
+        if desktop_excel.exists():
+            raise ProcessingError(f"桌面已存在同名文件：{desktop_excel}")
         shutil.copy2(app_output_path, desktop_excel)
+        report["excel_desktop_path"] = str(desktop_excel)
         report["desktop_output_path"] = str(desktop_excel)
-        report["desktop_report_path"] = str(desktop_dir / report_path.name)
-        report["actual_save_location"] = str(desktop_dir)
+        report["desktop_excel_copied"] = True
+        if options.output_report_to_desktop:
+            report["report_desktop_path"] = str(desktop_dir / report_path.name)
+            report["desktop_report_path"] = str(desktop_dir / report_path.name)
+        report["actual_save_location"] = str(desktop_excel)
         report["output_copy_status"] = "desktop_excel_copied"
         report["desktop_output_message"] = f"已输出到桌面：{output_excel.name}"
     except Exception as exc:
         report["output_copy_status"] = "desktop_excel_copy_failed_fallback_app_output"
-        report.setdefault("warnings", []).append(f"桌面输出失败，已保存在程序 output 目录。原因：{exc}")
+        report.setdefault("warnings", []).append(f"桌面输出失败，已保存在程序 output 目录：{app_output_path}。原因：{exc}")
 
 
 def finalize_report_output_copy(report: dict, report_path: Path):
-    desktop_report_path = report.get("desktop_report_path")
+    desktop_report_path = report.get("report_desktop_path")
     if not desktop_report_path:
         return
     try:
+        desktop_report = Path(desktop_report_path)
+        if desktop_report.exists():
+            raise ProcessingError(f"桌面已存在同名报告：{desktop_report}")
         report["output_copy_status"] = "desktop_excel_and_report_copied"
+        report["desktop_report_copied"] = True
         write_json(report_path, report)
-        shutil.copy2(report_path, desktop_report_path)
+        shutil.copy2(report_path, desktop_report)
     except Exception as exc:
+        report["desktop_report_copied"] = False
         report["output_copy_status"] = "desktop_report_copy_failed_excel_copied"
         report.setdefault("warnings", []).append(f"处理报告复制到桌面失败，程序 output 目录中仍保留报告。原因：{exc}")
 
@@ -250,6 +281,33 @@ def find_windows_desktop() -> Path | None:
         except OSError:
             continue
     return candidates[0].resolve() if candidates else None
+
+
+def choose_output_version(output_root: Path, desktop_dir: Path | None, output_stem: str, output_suffix: str) -> int:
+    output_root = Path(output_root).resolve()
+    for version in range(1, 1000):
+        stem = versioned_output_stem(output_stem, version)
+        excel_name = f"{stem}{output_suffix}"
+        report_name = f"{stem}_处理报告.json"
+        if output_name_exists(output_root, excel_name) or output_name_exists(output_root, report_name):
+            continue
+        if desktop_dir and ((desktop_dir / excel_name).exists() or (desktop_dir / report_name).exists()):
+            continue
+        return version
+    raise ProcessingError("无法生成唯一版本文件名，请清理旧输出后重试。")
+
+
+def versioned_output_stem(output_stem: str, version: int) -> str:
+    return output_stem if version <= 1 else f"{output_stem}_v{version}"
+
+
+def output_name_exists(output_root: Path, filename: str) -> bool:
+    if not output_root.exists():
+        return False
+    for path in output_root.rglob(filename):
+        if path.is_file():
+            return True
+    return False
 
 
 def generate_watermark_preview(
@@ -326,31 +384,34 @@ def process_image_based_excel(source_path: Path, output_excel: Path, temp_dir: P
     workbook = Workbook()
     default_sheet = workbook.active
     workbook.remove(default_sheet)
-    allow_com_capture = True
+    image_paths: dict[str, Path] = {}
+    for index, sheet_info in enumerate(target_sheets, start=1):
+        image_paths[sheet_info["name"]] = temp_dir / f"sheet_{index:03d}_{uuid4().hex[:8]}.png"
+
+    capture_results = {}
+    if target_sheets:
+        capture_results = capture_workbook_sheets_to_pngs(
+            source_path,
+            [sheet["name"] for sheet in target_sheets],
+            options.image_range_type,
+            image_paths,
+            options,
+            temp_dir,
+            allow_fallback=options.allow_approximate_fallback,
+            window_mode=options.screenshot_window_mode,
+            progress_callback=progress_callback,
+        )
 
     for index, sheet_info in enumerate(target_sheets, start=1):
         sheet_name = sheet_info["name"]
-        report_progress(progress_callback, f"正在真实截图工作表：{sheet_name}", index, len(target_sheets))
         processed_sheets.append(sheet_name)
         output_sheet = workbook.create_sheet(title=sheet_name)
         output_sheet.sheet_view.showGridLines = False
-        image_path = temp_dir / f"sheet_{index:03d}_{uuid4().hex[:8]}.png"
         try:
-            image_result = generate_sheet_image(
-                source_path,
-                sheet_name,
-                options.image_range_type,
-                options,
-                image_path,
-                temp_dir,
-                allow_com_capture,
-                prefer_silent=False,
-                allow_fallback=options.allow_approximate_fallback,
-            )
-            if image_result.get("preview_engine") == "openpyxl + Pillow" and any(
-                "截图预览" in warning or "CopyPicture" in warning for warning in image_result.get("warnings", [])
-            ):
-                allow_com_capture = False
+            image_path = image_paths[sheet_name]
+            image_result = capture_results.get(sheet_name)
+            if not image_result:
+                raise ProcessingError("当前工作表没有生成截图。")
             engines.add(image_result.get("preview_engine", "openpyxl + Pillow"))
             capture_methods.add(image_result.get("capture_method", "fallback_openpyxl"))
             warnings_list.extend(image_result.get("warnings", []))
@@ -434,6 +495,7 @@ def process_image_based_excel(source_path: Path, output_excel: Path, temp_dir: P
         "formula_removed": True,
         "copy_risk_level": "high" if used_approximate_fallback else "low",
         "screenshot_engine": screenshot_engine,
+        "window_mode": options.screenshot_window_mode,
         "screenshot_capture_methods": sorted(capture_methods),
         "images_preserved_in_screenshot": visual_objects_preserved,
         "charts_preserved_in_screenshot": visual_objects_preserved,
@@ -481,6 +543,306 @@ def generate_sheet_image(
         prefer_silent=prefer_silent,
         allow_com=allow_com,
     )
+
+
+def capture_workbook_sheets_to_pngs(
+    workbook_path: Path,
+    sheet_names: list[str],
+    range_type: str,
+    output_paths: dict[str, Path],
+    options: ExcelPreviewOptions,
+    temp_dir: Path,
+    allow_fallback: bool = False,
+    window_mode: str = "quiet",
+    progress_callback=None,
+) -> dict[str, dict]:
+    errors: list[str] = []
+    for prefer_wps in (False, True):
+        engine_name = "WPS COM" if prefer_wps else "Excel COM"
+        try:
+            return capture_workbook_sheets_with_com(
+                workbook_path,
+                sheet_names,
+                range_type,
+                output_paths,
+                options,
+                temp_dir,
+                prefer_wps=prefer_wps,
+                window_mode=window_mode,
+                progress_callback=progress_callback,
+            )
+        except ProcessingError as exc:
+            errors.append(f"{engine_name}：{exc}")
+
+    if allow_fallback:
+        results = {}
+        for index, sheet_name in enumerate(sheet_names, start=1):
+            report_progress(progress_callback, f"正在近似绘制：{sheet_name}", index, len(sheet_names))
+            result = generate_preview_with_openpyxl(workbook_path, sheet_name, range_type, options, output_paths[sheet_name])
+            result.setdefault("warnings", []).extend(errors + [APPROXIMATE_FALLBACK_WARNING])
+            result["screenshot_function_shared"] = True
+            result["warnings"] = dedupe_texts(result.get("warnings", []))
+            results[sheet_name] = result
+        return results
+
+    hint = "安静模式截图失败，可切换到可见调试模式后重试。" if window_mode == "quiet" else ""
+    detail = "；".join(errors)
+    raise ProcessingError(f"{REAL_SCREENSHOT_FAILURE_MESSAGE}{hint} 失败详情：{detail}")
+
+
+def capture_workbook_sheets_with_com(
+    workbook_path: Path,
+    sheet_names: list[str],
+    range_type: str,
+    output_paths: dict[str, Path],
+    options: ExcelPreviewOptions,
+    temp_dir: Path,
+    prefer_wps: bool,
+    window_mode: str,
+    progress_callback=None,
+) -> dict[str, dict]:
+    try:
+        import pythoncom
+        import win32com.client
+    except Exception as exc:
+        raise ProcessingError(f"Excel/WPS COM 不可用：{exc}") from exc
+
+    engine_name = "WPS COM" if prefer_wps else "Excel COM"
+    workbook_path = Path(workbook_path).resolve()
+    temp_dir = Path(temp_dir).resolve()
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_copy = (temp_dir / f"workbook_capture_{uuid4().hex[:8]}{workbook_path.suffix}").resolve()
+    shutil.copy2(workbook_path, temp_copy)
+    app = None
+    workbook = None
+    app_process_ids: set[int] = set()
+    office_processes_before = office_process_snapshot()
+    pythoncom.CoInitialize()
+    try:
+        app = win32com.client.DispatchEx("Ket.Application" if prefer_wps else "Excel.Application")
+        app_process_ids = com_app_process_ids(app)
+        configure_com_capture_window(app, window_mode)
+        workbook = open_com_workbook(app, temp_copy, read_only=True)
+        time.sleep(0.4)
+        configure_active_com_window(app, window_mode)
+        results = {}
+        for index, sheet_name in enumerate(sheet_names, start=1):
+            report_progress(progress_callback, f"正在截图：{sheet_name}", index, len(sheet_names))
+            output_path = Path(output_paths[sheet_name]).resolve()
+            configure_active_com_window(app, window_mode)
+            result = capture_open_workbook_sheet_to_png(
+                engine_name,
+                app,
+                workbook,
+                sheet_name,
+                range_type,
+                options,
+                output_path,
+                window_mode=window_mode,
+            )
+            result["screenshot_function_shared"] = True
+            result["window_mode"] = window_mode
+            results[sheet_name] = result
+        return results
+    except ProcessingError:
+        raise
+    except Exception as exc:
+        message = str(exc)
+        if looks_like_locked_file_error(message):
+            raise ProcessingError("文件正在被 WPS/Excel 占用，请先关闭后再处理。") from exc
+        raise ProcessingError(f"{engine_name} 批量截图失败：{message}") from exc
+    finally:
+        if workbook is not None:
+            try:
+                workbook.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if app is not None:
+            cleanup_com_application(app, app_process_ids)
+        cleanup_new_office_processes(office_processes_before)
+        if temp_copy.exists():
+            try:
+                temp_copy.unlink()
+            except OSError:
+                pass
+        pythoncom.CoUninitialize()
+
+
+def configure_com_capture_window(app, window_mode: str):
+    try:
+        app.Visible = True
+        app.DisplayAlerts = False
+    except Exception:
+        pass
+    try:
+        app.ScreenUpdating = True
+        app.EnableEvents = False
+    except Exception:
+        pass
+    if window_mode == "quiet":
+        move_com_window_offscreen(app)
+
+
+def configure_active_com_window(app, window_mode: str):
+    if window_mode == "quiet":
+        move_com_window_offscreen(app)
+
+
+def move_com_window_offscreen(app):
+    targets = [app]
+    try:
+        active_window = app.ActiveWindow
+    except Exception:
+        active_window = None
+    if active_window is not None:
+        targets.append(active_window)
+    for target in targets:
+        try:
+            target.WindowState = -4143
+        except Exception:
+            pass
+        for attr, value in (("Left", -32000), ("Top", -32000), ("Width", 900), ("Height", 700)):
+            try:
+                setattr(target, attr, value)
+            except Exception:
+                pass
+
+
+def com_app_process_ids(app) -> set[int]:
+    process_ids: set[int] = set()
+    hwnd_candidates = []
+    for attr in ("Hwnd", "HWND", "hWnd"):
+        try:
+            hwnd = int(getattr(app, attr) or 0)
+            if hwnd:
+                hwnd_candidates.append(hwnd)
+        except Exception:
+            pass
+    try:
+        active_window = app.ActiveWindow
+        for attr in ("Hwnd", "HWND", "hWnd"):
+            try:
+                hwnd = int(getattr(active_window, attr) or 0)
+                if hwnd:
+                    hwnd_candidates.append(hwnd)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if not hwnd_candidates:
+        return process_ids
+    try:
+        import win32process
+    except Exception:
+        return process_ids
+    for hwnd in hwnd_candidates:
+        try:
+            _thread_id, process_id = win32process.GetWindowThreadProcessId(hwnd)
+            if process_id:
+                process_ids.add(int(process_id))
+        except Exception:
+            continue
+    return process_ids
+
+
+def cleanup_com_application(app, process_ids: set[int]):
+    try:
+        app.DisplayAlerts = False
+    except Exception:
+        pass
+    try:
+        app.Quit()
+    except Exception:
+        pass
+    if not process_ids:
+        return
+    time.sleep(0.6)
+    for process_id in process_ids:
+        terminate_process_if_running(process_id)
+
+
+def office_process_snapshot() -> dict[int, str]:
+    command = (
+        "$names=@('EXCEL','et','wps','wpp');"
+        "Get-Process | Where-Object { $names -contains $_.ProcessName } | "
+        "Select-Object ProcessName,Id | ConvertTo-Json -Compress"
+    )
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=5,
+        )
+    except Exception:
+        return {}
+    if completed.returncode != 0:
+        return {}
+    data = (completed.stdout or "").strip()
+    if not data:
+        return {}
+    try:
+        parsed = json.loads(data)
+    except Exception:
+        return {}
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    snapshot: dict[int, str] = {}
+    parsed_items = parsed if isinstance(parsed, list) else []
+    for item in parsed_items:
+        try:
+            process_id = int(item.get("Id") or 0)
+            process_name = str(item.get("ProcessName") or "").lower()
+        except Exception:
+            continue
+        if process_id and process_name in OFFICE_PROCESS_NAMES:
+            snapshot[process_id] = process_name
+    return snapshot
+
+
+def cleanup_new_office_processes(before_snapshot: dict[int, str]):
+    if before_snapshot is None:
+        before_snapshot = {}
+    time.sleep(0.8)
+    for _attempt in range(2):
+        after_snapshot = office_process_snapshot()
+        new_process_ids = [
+            process_id
+            for process_id, process_name in after_snapshot.items()
+            if process_id not in before_snapshot and process_name in OFFICE_PROCESS_NAMES
+        ]
+        if not new_process_ids:
+            return
+        for process_id in new_process_ids:
+            terminate_process_if_running(process_id)
+        time.sleep(0.5)
+
+
+def terminate_process_if_running(process_id: int):
+    try:
+        import win32api
+        import win32con
+        import win32process
+    except Exception:
+        return
+    try:
+        query_flag = getattr(win32con, "PROCESS_QUERY_LIMITED_INFORMATION", 0x1000)
+        handle = win32api.OpenProcess(query_flag | win32con.PROCESS_TERMINATE, False, int(process_id))
+    except Exception:
+        return
+    try:
+        exit_code = win32process.GetExitCodeProcess(handle)
+        if exit_code == 259:
+            win32api.TerminateProcess(handle, 0)
+    except Exception:
+        pass
+    finally:
+        try:
+            handle.Close()
+        except Exception:
+            pass
 
 
 def capture_sheet_to_png(
@@ -1143,60 +1505,16 @@ def generate_preview_with_com(
     engine_name = "WPS COM" if prefer_wps else "Excel COM"
     app = None
     workbook = None
-    temp_base = preview_path.with_name(f"range_base_{uuid4().hex[:8]}.png")
-    temp_pdf = preview_path.with_name(f"range_base_{uuid4().hex[:8]}.pdf")
+    app_process_ids: set[int] = set()
+    office_processes_before = office_process_snapshot()
     pythoncom.CoInitialize()
     try:
         app = win32com.client.DispatchEx("Ket.Application" if prefer_wps else "Excel.Application")
-        app.Visible = not prefer_silent
-        app.DisplayAlerts = False
-        try:
-            app.ScreenUpdating = not prefer_silent
-            app.EnableEvents = False
-        except Exception:
-            pass
+        app_process_ids = com_app_process_ids(app)
+        configure_com_capture_window(app, "quiet" if prefer_silent else "visible")
         workbook = open_com_workbook(app, workbook_path, read_only=True)
-        sheet = get_com_worksheet(workbook, sheet_name)
-        sheet.Activate()
-        target_range = preview_target_range(sheet, range_type)
-        width = max(240.0, float(target_range.Width))
-        height = max(160.0, float(target_range.Height))
-        if prefer_silent:
-            capture_method = "pdf_export"
-            try:
-                export_range_to_pdf_image(sheet, target_range, range_type, temp_pdf, temp_base)
-            except ProcessingError as pdf_exc:
-                try:
-                    app.Visible = True
-                    app.WindowState = -4140
-                except Exception:
-                    pass
-                try:
-                    capture_range_with_clipboard(app, sheet, target_range, temp_base)
-                    capture_method = "copy_picture_clipboard"
-                except ProcessingError as clipboard_exc:
-                    raise ProcessingError(f"{engine_name} 静默 PDF 渲染失败：{pdf_exc}；剪贴板截图也失败：{clipboard_exc}") from clipboard_exc
-        else:
-            capture_method = "copy_picture_clipboard"
-            try:
-                capture_range_with_clipboard(app, sheet, target_range, temp_base)
-            except ProcessingError as clipboard_exc:
-                try:
-                    export_range_to_pdf_image(sheet, target_range, range_type, temp_pdf, temp_base)
-                    capture_method = "pdf_export"
-                except ProcessingError as pdf_exc:
-                    raise ProcessingError(f"{engine_name} 真实截图失败：{clipboard_exc}；PDF 渲染也失败：{pdf_exc}") from pdf_exc
-        if preview_image_looks_blank(temp_base):
-            raise ProcessingError(f"{engine_name} 截图预览未截取到工作表内容。")
-        overlay_watermark(temp_base, preview_path, options)
-        return {
-            "preview_engine": engine_name,
-            "screenshot_engine": engine_name,
-            "capture_method": capture_method,
-            "range_type": range_type,
-            "pixel_size": {"width": int(width), "height": int(height)},
-            "warnings": [],
-        }
+        configure_active_com_window(app, "quiet" if prefer_silent else "visible")
+        return capture_open_workbook_sheet_to_png(engine_name, app, workbook, sheet_name, range_type, options, preview_path)
     except ProcessingError:
         raise
     except Exception as exc:
@@ -1211,11 +1529,50 @@ def generate_preview_with_com(
             except Exception:
                 pass
         if app is not None:
+            cleanup_com_application(app, app_process_ids)
+        cleanup_new_office_processes(office_processes_before)
+        pythoncom.CoUninitialize()
+
+
+def capture_open_workbook_sheet_to_png(engine_name: str, app, workbook, sheet_name: str, range_type: str, options: ExcelPreviewOptions, output_path: Path, window_mode: str | None = None) -> dict:
+    output_path = Path(output_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_base = output_path.with_name(f"range_base_{uuid4().hex[:8]}.png")
+    temp_pdf = output_path.with_name(f"range_base_{uuid4().hex[:8]}.pdf")
+    try:
+        sheet = get_com_worksheet(workbook, sheet_name)
+        sheet.Activate()
+        if window_mode:
+            configure_active_com_window(app, window_mode)
+        try:
+            app.ActiveWindow.Activate()
+        except Exception:
+            pass
+        target_range = preview_target_range(sheet, range_type)
+        width = max(240.0, float(target_range.Width))
+        height = max(160.0, float(target_range.Height))
+        capture_method = "copy_picture_clipboard"
+        try:
+            capture_range_with_clipboard(app, sheet, target_range, temp_base)
+        except ProcessingError as clipboard_exc:
             try:
-                app.DisplayAlerts = False
-                app.Quit()
-            except Exception:
-                pass
+                export_range_to_pdf_image(sheet, target_range, range_type, temp_pdf, temp_base)
+                capture_method = "pdf_export"
+            except ProcessingError as pdf_exc:
+                raise ProcessingError(f"{engine_name} 真实截图失败：{clipboard_exc}；PDF 渲染也失败：{pdf_exc}") from pdf_exc
+        if preview_image_looks_blank(temp_base):
+            raise ProcessingError(f"{engine_name} 截图预览未截取到工作表内容。")
+        overlay_watermark(temp_base, output_path, options)
+        ensure_png_created(output_path)
+        return {
+            "preview_engine": engine_name,
+            "screenshot_engine": engine_name,
+            "capture_method": capture_method,
+            "range_type": range_type,
+            "pixel_size": {"width": int(width), "height": int(height)},
+            "warnings": [],
+        }
+    finally:
         if temp_base.exists():
             try:
                 temp_base.unlink()
@@ -1226,7 +1583,6 @@ def generate_preview_with_com(
                 temp_pdf.unlink()
             except OSError:
                 pass
-        pythoncom.CoUninitialize()
 
 
 def open_com_workbook(app, workbook_path: Path, read_only: bool):
@@ -1255,10 +1611,17 @@ def open_com_workbook(app, workbook_path: Path, read_only: bool):
 
 def get_com_worksheet(workbook, sheet_name: str):
     target = str(sheet_name).strip()
-    try:
-        count = int(workbook.Worksheets.Count)
-    except Exception as exc:
-        raise ProcessingError("无法读取工作表列表。") from exc
+    count = None
+    last_error = None
+    for _ in range(15):
+        try:
+            count = int(workbook.Worksheets.Count)
+            break
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.2)
+    if count is None:
+        raise ProcessingError("无法读取工作表列表。") from last_error
     for index in range(1, count + 1):
         try:
             sheet = workbook.Worksheets(index)
@@ -1621,6 +1984,9 @@ def options_from_form(form) -> ExcelPreviewOptions:
     output_mode = (form.get("output_mode") or "desktop").strip()
     if output_mode not in {"desktop", "app_output"}:
         output_mode = "desktop"
+    screenshot_window_mode = (form.get("screenshot_window_mode") or "quiet").strip()
+    if screenshot_window_mode not in {"quiet", "visible"}:
+        screenshot_window_mode = "quiet"
     convert_formulas = parse_bool(form.get("convert_formulas"), True)
     if security_mode == "image_based":
         convert_formulas = False
@@ -1641,6 +2007,8 @@ def options_from_form(form) -> ExcelPreviewOptions:
         image_range_type=image_range_type,
         allow_approximate_fallback=parse_bool(form.get("allow_approximate_fallback"), False),
         output_mode=output_mode,
+        output_report_to_desktop=parse_bool(form.get("output_report_to_desktop"), False),
+        screenshot_window_mode=screenshot_window_mode,
     )
 
 

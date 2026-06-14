@@ -33,6 +33,8 @@ const excelProtectWorkbook = document.getElementById("excelProtectWorkbook");
 const excelIncludeHidden = document.getElementById("excelIncludeHidden");
 const excelFallbackMode = document.getElementById("excelFallbackMode");
 const excelOutputMode = document.getElementById("excelOutputMode");
+const excelOutputReportToDesktop = document.getElementById("excelOutputReportToDesktop");
+const excelWindowMode = document.getElementById("excelWindowMode");
 const excelFormulaModeHint = document.getElementById("excelFormulaModeHint");
 const excelSheetSelect = document.getElementById("excelSheetSelect");
 const excelPreviewRange = document.getElementById("excelPreviewRange");
@@ -330,6 +332,8 @@ function buildExcelOptionsFormData() {
   formData.append("image_range_type", excelPreviewRange.value || "auto");
   formData.append("allow_approximate_fallback", excelFallbackMode.value === "approximate" ? "1" : "0");
   formData.append("output_mode", excelOutputMode.value || "desktop");
+  formData.append("output_report_to_desktop", excelOutputReportToDesktop.checked ? "1" : "0");
+  formData.append("screenshot_window_mode", excelWindowMode.value || "quiet");
   appendCheckbox(formData, "convert_formulas", excelConvertFormulas);
   appendCheckbox(formData, "add_watermark", excelAddWatermark);
   appendCheckbox(formData, "protect_sheets", excelProtectSheets);
@@ -374,7 +378,9 @@ async function processExcelFile() {
     formData.append("upload_id", excelUploadId);
   }
   const slowTimer = window.setTimeout(() => {
-    excelStatusText.textContent = "文件较大，正在后台生成，请稍等。";
+    excelStatusText.textContent = (excelWindowMode.value || "quiet") === "quiet"
+      ? "正在安静模式处理，WPS/Excel 可能会短暂出现在任务栏，这是正常现象。"
+      : "正在调用 WPS/Excel 真实截图，窗口可能短暂出现，请勿手动关闭。";
   }, 3000);
 
   try {
@@ -491,12 +497,15 @@ function setExcelPreviewScale(scale) {
 
 function renderExcelResult(job) {
   const downloads = job.download_urls || {};
+  const excelDownloadUrl = job.excel_download_url || downloads.excel || "";
+  const reportDownloadUrl = job.report_download_url || downloads.report || "";
   const warnings = job.warnings && job.warnings.length ? `<div class="warning">${job.warnings.map(escapeHtml).join("<br>")}</div>` : "";
   const errorsHtml = job.errors && job.errors.length ? `<div class="errors">${job.errors.map(escapeHtml).join("<br>")}</div>` : "";
   const formulaNote = job.formula_conversion_note ? `<div class="job-meta">${escapeHtml(job.formula_conversion_note)}</div>` : "";
   const riskNotice = job.risk_notice ? `<div class="warning">${escapeHtml(job.risk_notice)}</div>` : "";
   const desktopMessage = job.desktop_output_message ? `<div class="job-meta">${escapeHtml(job.desktop_output_message)}</div>` : "";
-  const actualSaveLocation = job.actual_save_location || job.app_output_path || "";
+  const actualSaveLocation = job.excel_desktop_path || job.excel_output_path || job.actual_save_location || job.app_output_path || "";
+  const reportLocation = job.report_desktop_path || job.report_output_path || "程序 output 目录，可点击“下载处理报告 JSON”查看。";
   const formulaCells = job.preview_security_mode === "image_based"
     ? `<div>公式转数值：已跳过（图片化模式无需转值）</div>`
     : `
@@ -509,11 +518,13 @@ function renderExcelResult(job) {
         <div>
           <div class="job-title">${escapeHtml(job.source_file)}</div>
           <div class="job-meta">输出文件：${escapeHtml(job.output_excel)}</div>
+          <div class="job-meta">当前版本：${escapeHtml(job.output_version || "v1")}</div>
           ${actualSaveLocation ? `<div class="job-meta">实际保存位置：${escapeHtml(actualSaveLocation)}</div>` : ""}
+          <div class="job-meta">报告位置：${escapeHtml(reportLocation)}</div>
         </div>
         <div class="download-row">
-          ${downloads.excel ? `<a href="${downloads.excel}" download>下载预览版 Excel</a>` : ""}
-          ${downloads.report ? `<a href="${downloads.report}" download>下载处理报告 JSON</a>` : ""}
+          ${excelDownloadUrl ? `<a href="${excelDownloadUrl}" download>下载预览版 Excel</a>` : ""}
+          ${reportDownloadUrl ? `<a href="${reportDownloadUrl}" download>下载处理报告 JSON</a>` : ""}
         </div>
       </div>
       <div class="excel-result-grid">
@@ -533,6 +544,9 @@ function renderExcelResult(job) {
         <div>插入图片：${job.inserted_images_count || 0} / ${job.expected_sheets_count || 0}</div>
         <div>预览/导出共用截图函数：${job.screenshot_function_shared ? "是" : "否"}</div>
         <div>输出位置：${escapeHtml(outputModeLabel(job.output_mode))}</div>
+        <div>截图窗口模式：${escapeHtml(windowModeLabel(job.window_mode))}</div>
+        <div>桌面 Excel：${job.desktop_excel_copied ? "已复制" : "未复制"}</div>
+        <div>桌面报告：${job.desktop_report_copied ? "已复制" : "未复制"}</div>
         <div>打开密码：未设置</div>
         <div>编辑/保护：${job.edit_protection_enabled ? "已开启" : "未开启"}</div>
         <div>原始单元格数据：${job.real_cell_data_removed ? "已移除" : "仍保留"}</div>
@@ -963,6 +977,13 @@ function outputModeLabel(mode) {
   return {
     desktop: "输出到桌面",
     app_output: "程序 output 目录",
+  }[mode] || "-";
+}
+
+function windowModeLabel(mode) {
+  return {
+    quiet: "安静模式",
+    visible: "可见调试模式",
   }[mode] || "-";
 }
 
