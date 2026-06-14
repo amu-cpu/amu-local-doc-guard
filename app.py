@@ -126,6 +126,66 @@ def excel_preview():
     return jsonify({"job": with_excel_urls(report)})
 
 
+@app.post("/excel/export")
+def start_excel_export():
+    upload_id = (request.form.get("upload_id") or "").strip()
+    if not upload_id:
+        return jsonify({"error": "当前文件不存在，请重新上传 Excel。"}), 400
+    try:
+        options = options_from_form(request.form)
+    except ProcessingError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    task_id = uuid4().hex
+    task = {
+        "task_id": task_id,
+        "state": "queued",
+        "message": "准备导出 Excel...",
+        "current": 0,
+        "total": None,
+        "kind": "excel",
+    }
+    with TASK_LOCK:
+        TASKS[task_id] = task
+    TASK_EXECUTOR.submit(run_excel_export_task, task_id, upload_id, options)
+    return jsonify({"task_id": task_id})
+
+
+@app.get("/excel/export-status/<task_id>")
+def excel_export_status(task_id: str):
+    with TASK_LOCK:
+        task = copy.deepcopy(TASKS.get(task_id))
+    if not task:
+        return jsonify({"error": "任务不存在。"}), 404
+    if task.get("state") == "done" and task.get("report"):
+        task["job"] = with_excel_urls(task["report"])
+        task.pop("report", None)
+    return jsonify(task)
+
+
+def run_excel_export_task(task_id: str, upload_id: str, options):
+    def progress(message: str, current: int | None = None, total: int | None = None):
+        with TASK_LOCK:
+            task = TASKS.get(task_id)
+            if not task:
+                return
+            task["state"] = "running"
+            task["message"] = message
+            if current is not None:
+                task["current"] = current
+            if total is not None:
+                task["total"] = total
+
+    try:
+        progress("正在后台导出 Excel...", 0, None)
+        report = process_excel_preview_from_upload(upload_id, OUTPUT_ROOT, options=options, progress_callback=progress)
+        with TASK_LOCK:
+            TASKS[task_id].update({"state": "done", "message": "导出完成", "report": report})
+    except Exception as exc:
+        with TASK_LOCK:
+            TASKS[task_id].update({"state": "error", "message": f"导出失败：{exc}"})
+
+
 @app.post("/excel/inspect")
 def excel_inspect():
     file = request.files.get("file")

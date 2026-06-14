@@ -342,9 +342,13 @@ function syncExcelSecurityMode() {
 }
 
 async function processExcelFile() {
-  if (!excelUploadId && !selectedExcelFile) return;
+  if (!excelUploadId) {
+    showExcelErrors([{ file: "Excel 文件", error: "请先上传 Excel，并等待工作表读取完成后再导出。" }]);
+    return;
+  }
   const fileName = selectedExcelFile?.name || excelUploadMeta?.original_name || "Excel 文件";
-  excelStatusText.textContent = "正在生成预览版 Excel...";
+  excelStatusText.textContent = "正在导出 Excel...";
+  excelProcessBtn.textContent = "正在导出...";
   excelProcessBtn.disabled = true;
   excelErrors.hidden = true;
   excelErrors.innerHTML = "";
@@ -352,21 +356,45 @@ async function processExcelFile() {
   const formData = buildExcelOptionsFormData();
   if (excelUploadId) {
     formData.append("upload_id", excelUploadId);
-  } else if (selectedExcelFile) {
-    formData.append("file", selectedExcelFile);
   }
+  const slowTimer = window.setTimeout(() => {
+    excelStatusText.textContent = "文件较大，正在后台生成，请稍等。";
+  }, 3000);
 
   try {
-    const response = await fetch("/excel/preview", { method: "POST", body: formData });
+    const response = await fetch("/excel/export", { method: "POST", body: formData });
     const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "Excel 预览版生成失败");
-    renderExcelResult(payload.job);
-    excelStatusText.textContent = "生成完成";
+    if (!response.ok) throw new Error(payload.error || "Excel 导出失败");
+    await pollExcelExportTask(payload.task_id);
   } catch (error) {
     showExcelErrors([{ file: fileName, error: error.message }]);
-    excelStatusText.textContent = "生成失败";
+    excelStatusText.textContent = "导出失败";
   } finally {
+    window.clearTimeout(slowTimer);
+    excelProcessBtn.textContent = "直接导出 Excel";
     updateExcelActionState();
+  }
+}
+
+async function pollExcelExportTask(taskId) {
+  while (true) {
+    const response = await fetch(`/excel/export-status/${encodeURIComponent(taskId)}`);
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "读取 Excel 导出进度失败");
+    if (payload.current && payload.total) {
+      excelStatusText.textContent = `${payload.message || "正在导出"}（${payload.current} / ${payload.total} 个工作表）`;
+    } else {
+      excelStatusText.textContent = payload.message || "正在导出 Excel...";
+    }
+    if (payload.state === "done") {
+      renderExcelResult(payload.job);
+      excelStatusText.textContent = "导出完成";
+      return;
+    }
+    if (payload.state === "error") {
+      throw new Error(payload.message || "Excel 导出失败");
+    }
+    await wait(800);
   }
 }
 
