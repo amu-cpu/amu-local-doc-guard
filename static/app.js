@@ -31,6 +31,8 @@ const excelAddWatermark = document.getElementById("excelAddWatermark");
 const excelProtectSheets = document.getElementById("excelProtectSheets");
 const excelProtectWorkbook = document.getElementById("excelProtectWorkbook");
 const excelIncludeHidden = document.getElementById("excelIncludeHidden");
+const excelFallbackMode = document.getElementById("excelFallbackMode");
+const excelOutputMode = document.getElementById("excelOutputMode");
 const excelFormulaModeHint = document.getElementById("excelFormulaModeHint");
 const excelSheetSelect = document.getElementById("excelSheetSelect");
 const excelPreviewRange = document.getElementById("excelPreviewRange");
@@ -107,6 +109,7 @@ excelSecurityMode.addEventListener("change", () => {
   syncExcelSecurityMode();
   markExcelWatermarkDirty();
 });
+excelFallbackMode.addEventListener("change", markExcelWatermarkDirty);
 excelIncludeHidden.addEventListener("change", () => {
   populateExcelSheetSelect();
   markExcelWatermarkDirty();
@@ -129,6 +132,14 @@ excelPreviewZoomInBtn.addEventListener("click", () => setExcelPreviewScale(excel
 excelPreviewZoomOutBtn.addEventListener("click", () => setExcelPreviewScale(Math.max(0.4, excelPreviewScale - 0.2)));
 excelPreviewImage.addEventListener("load", () => {
   if (excelPreviewImage.dataset.mode !== "scale") setExcelPreviewFit();
+});
+excelPreviewImage.addEventListener("error", () => {
+  excelPreviewImage.hidden = true;
+  excelPreviewImage.removeAttribute("src");
+  excelPreviewPlaceholder.hidden = false;
+  excelPreviewStatus.textContent = "预览图片加载失败，请重新生成预览图。";
+  setExcelPreviewButtonsEnabled(Boolean(excelUploadId && excelSheetSelect.value));
+  showExcelErrors([{ file: "Excel 水印预览", error: "预览图片加载失败，请重新生成预览图。" }]);
 });
 syncExcelSecurityMode();
 closeModalBtn.addEventListener("click", closePreview);
@@ -234,6 +245,7 @@ function resetExcelUploadState() {
   excelPreviewImage.hidden = true;
   excelPreviewImage.removeAttribute("src");
   excelPreviewPlaceholder.hidden = false;
+  excelResults.innerHTML = "";
   setExcelPreviewButtonsEnabled(false);
   updateExcelActionState();
 }
@@ -316,6 +328,8 @@ function buildExcelOptionsFormData() {
   formData.append("protection_password", excelProtectionPassword.value || "123456");
   formData.append("preview_security_mode", excelSecurityMode.value || "image_based");
   formData.append("image_range_type", excelPreviewRange.value || "auto");
+  formData.append("allow_approximate_fallback", excelFallbackMode.value === "approximate" ? "1" : "0");
+  formData.append("output_mode", excelOutputMode.value || "desktop");
   appendCheckbox(formData, "convert_formulas", excelConvertFormulas);
   appendCheckbox(formData, "add_watermark", excelAddWatermark);
   appendCheckbox(formData, "protect_sheets", excelProtectSheets);
@@ -334,6 +348,7 @@ function syncExcelSecurityMode() {
   const imageBased = (excelSecurityMode.value || "image_based") === "image_based";
   excelConvertFormulas.disabled = imageBased;
   excelConvertFormulas.checked = !imageBased;
+  excelFallbackMode.disabled = !imageBased;
   if (excelFormulaModeHint) {
     excelFormulaModeHint.textContent = imageBased
       ? "图片化防复制版会直接截图当前显示效果，不需要公式转数值。"
@@ -352,6 +367,7 @@ async function processExcelFile() {
   excelProcessBtn.disabled = true;
   excelErrors.hidden = true;
   excelErrors.innerHTML = "";
+  excelResults.innerHTML = "";
 
   const formData = buildExcelOptionsFormData();
   if (excelUploadId) {
@@ -444,6 +460,9 @@ async function generateExcelWatermarkPreview() {
     excelPreviewZoomInBtn.disabled = false;
     excelPreviewZoomOutBtn.disabled = false;
   } catch (error) {
+    excelPreviewImage.hidden = true;
+    excelPreviewImage.removeAttribute("src");
+    excelPreviewPlaceholder.hidden = false;
     excelPreviewStatus.textContent = error.message;
     showExcelErrors([{ file: "Excel 水印预览", error: error.message }]);
   } finally {
@@ -476,6 +495,8 @@ function renderExcelResult(job) {
   const errorsHtml = job.errors && job.errors.length ? `<div class="errors">${job.errors.map(escapeHtml).join("<br>")}</div>` : "";
   const formulaNote = job.formula_conversion_note ? `<div class="job-meta">${escapeHtml(job.formula_conversion_note)}</div>` : "";
   const riskNotice = job.risk_notice ? `<div class="warning">${escapeHtml(job.risk_notice)}</div>` : "";
+  const desktopMessage = job.desktop_output_message ? `<div class="job-meta">${escapeHtml(job.desktop_output_message)}</div>` : "";
+  const actualSaveLocation = job.actual_save_location || job.app_output_path || "";
   const formulaCells = job.preview_security_mode === "image_based"
     ? `<div>公式转数值：已跳过（图片化模式无需转值）</div>`
     : `
@@ -488,6 +509,7 @@ function renderExcelResult(job) {
         <div>
           <div class="job-title">${escapeHtml(job.source_file)}</div>
           <div class="job-meta">输出文件：${escapeHtml(job.output_excel)}</div>
+          ${actualSaveLocation ? `<div class="job-meta">实际保存位置：${escapeHtml(actualSaveLocation)}</div>` : ""}
         </div>
         <div class="download-row">
           ${downloads.excel ? `<a href="${downloads.excel}" download>下载预览版 Excel</a>` : ""}
@@ -507,12 +529,17 @@ function renderExcelResult(job) {
         <div>公式处理引擎：${escapeHtml(job.formula_conversion_engine || "-")}</div>
         <div>截图方式：${escapeHtml(screenshotEngineLabel(job.screenshot_engine || job.processing_engine || "-"))}</div>
         <div>处理引擎：${escapeHtml(job.processing_engine || "-")}</div>
+        <div>图片插入自检：${job.image_insert_check_passed ? "通过" : "-"}</div>
+        <div>插入图片：${job.inserted_images_count || 0} / ${job.expected_sheets_count || 0}</div>
+        <div>预览/导出共用截图函数：${job.screenshot_function_shared ? "是" : "否"}</div>
+        <div>输出位置：${escapeHtml(outputModeLabel(job.output_mode))}</div>
         <div>打开密码：未设置</div>
         <div>编辑/保护：${job.edit_protection_enabled ? "已开启" : "未开启"}</div>
         <div>原始单元格数据：${job.real_cell_data_removed ? "已移除" : "仍保留"}</div>
         <div>复制风险：${escapeHtml(copyRiskLabel(job.copy_risk_level))}</div>
       </div>
       ${formulaNote}
+      ${desktopMessage}
       ${riskNotice}
       ${warnings}
       ${errorsHtml}
@@ -930,6 +957,13 @@ function copyRiskLabel(level) {
     medium: "中",
     high: "高",
   }[level] || "-";
+}
+
+function outputModeLabel(mode) {
+  return {
+    desktop: "输出到桌面",
+    app_output: "程序 output 目录",
+  }[mode] || "-";
 }
 
 function screenshotEngineLabel(engine) {

@@ -115,6 +115,26 @@
                 <p><strong>普通锁定版：</strong>适合需要保留真实单元格结构的预览。可保护工作表和公式转值，但客户仍可能复制单元格内容。</p>
               </div>
               <label>
+                截图失败处理方式
+                <select id="excelFallbackMode">
+                  <option value="stop" selected>真实截图失败则停止导出</option>
+                  <option value="approximate">允许近似绘制兜底，不推荐</option>
+                </select>
+              </label>
+              <div class="hint">
+                图片化防复制版依赖 Excel/WPS 真实截图能力。真实截图失败时，建议停止导出并修复环境，不建议使用近似绘制兜底，否则可能丢失图表、图片和原始排版。
+              </div>
+              <label>
+                输出位置
+                <select id="excelOutputMode">
+                  <option value="desktop" selected>输出到桌面</option>
+                  <option value="app_output">输出到程序 output 目录</option>
+                </select>
+              </label>
+              <div class="hint">
+                “直接导出 Excel”用于生成文件；“下载预览版 Excel”只会在导出完成后出现，用于下载已经生成好的预览版 Excel。
+              </div>
+              <label>
                 水印文字
                 <input id="excelWatermarkText" type="text" value="保密文件">
               </label>

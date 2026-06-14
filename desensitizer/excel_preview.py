@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
+from zipfile import ZipFile
 
 from PIL import Image, ImageDraw, ImageFont, ImageGrab
 
@@ -35,6 +36,14 @@ SPACING_FACTORS = {
     "medium": (1.35, 145),
     "wide": (1.85, 210),
 }
+REAL_SCREENSHOT_FAILURE_MESSAGE = (
+    "真实截图失败，未生成图片化防复制版 Excel。当前环境无法通过 Excel/WPS COM 获取工作表原样截图。"
+    "请尝试：1）关闭所有 WPS/Excel 进程后重试；2）用 WPS/Excel 打开原文件并另存为 xlsx；"
+    "3）重新启动本工具；4）检查 pywin32 和 WPS/Excel COM 是否可用。"
+)
+APPROXIMATE_FALLBACK_WARNING = (
+    "当前不是原样截图，仅为近似绘制，复杂图表、图片、形状和排版可能丢失，不建议作为客户交付预览版。"
+)
 
 
 @dataclass
@@ -53,6 +62,8 @@ class ExcelPreviewOptions:
     include_hidden_sheets: bool = False
     preview_security_mode: str = "image_based"
     image_range_type: str = "auto"
+    allow_approximate_fallback: bool = False
+    output_mode: str = "desktop"
 
 
 def process_excel_preview(
@@ -118,6 +129,9 @@ def process_excel_preview(
             "local_only": True,
         }
     )
+    prepare_excel_output_location(report, output_excel, report_path, options)
+    write_json(report_path, report)
+    finalize_report_output_copy(report, report_path)
     write_json(report_path, report)
     return report
 
@@ -169,6 +183,75 @@ def process_excel_preview_from_upload(
     return process_excel_preview(upload_meta["original_name"], save_func, output_root, options=options, progress_callback=progress_callback)
 
 
+def prepare_excel_output_location(report: dict, output_excel: Path, report_path: Path, options: ExcelPreviewOptions):
+    app_output_path = Path(output_excel).resolve()
+    app_report_path = Path(report_path).resolve()
+    report.update(
+        {
+            "output_mode": options.output_mode,
+            "app_output_path": str(app_output_path),
+            "app_report_path": str(app_report_path),
+            "desktop_output_enabled": options.output_mode == "desktop",
+            "desktop_output_path": "",
+            "desktop_report_path": "",
+            "actual_save_location": str(app_output_path.parent),
+            "output_copy_status": "app_output_only",
+        }
+    )
+    if options.output_mode != "desktop":
+        return
+
+    desktop_dir = find_windows_desktop()
+    if not desktop_dir:
+        report["output_copy_status"] = "desktop_not_found_fallback_app_output"
+        report.setdefault("warnings", []).append("桌面输出失败，已保存在程序 output 目录。")
+        return
+
+    try:
+        desktop_dir.mkdir(parents=True, exist_ok=True)
+        desktop_excel = desktop_dir / output_excel.name
+        shutil.copy2(app_output_path, desktop_excel)
+        report["desktop_output_path"] = str(desktop_excel)
+        report["desktop_report_path"] = str(desktop_dir / report_path.name)
+        report["actual_save_location"] = str(desktop_dir)
+        report["output_copy_status"] = "desktop_excel_copied"
+        report["desktop_output_message"] = f"已输出到桌面：{output_excel.name}"
+    except Exception as exc:
+        report["output_copy_status"] = "desktop_excel_copy_failed_fallback_app_output"
+        report.setdefault("warnings", []).append(f"桌面输出失败，已保存在程序 output 目录。原因：{exc}")
+
+
+def finalize_report_output_copy(report: dict, report_path: Path):
+    desktop_report_path = report.get("desktop_report_path")
+    if not desktop_report_path:
+        return
+    try:
+        report["output_copy_status"] = "desktop_excel_and_report_copied"
+        write_json(report_path, report)
+        shutil.copy2(report_path, desktop_report_path)
+    except Exception as exc:
+        report["output_copy_status"] = "desktop_report_copy_failed_excel_copied"
+        report.setdefault("warnings", []).append(f"处理报告复制到桌面失败，程序 output 目录中仍保留报告。原因：{exc}")
+
+
+def find_windows_desktop() -> Path | None:
+    candidates = []
+    userprofile = os.environ.get("USERPROFILE")
+    if userprofile:
+        candidates.append(Path(userprofile) / "Desktop")
+    onedrive = os.environ.get("OneDrive") or os.environ.get("OneDriveConsumer")
+    if onedrive:
+        candidates.append(Path(onedrive) / "Desktop")
+    candidates.append(Path.home() / "Desktop")
+    for candidate in candidates:
+        try:
+            if candidate.exists() and candidate.is_dir():
+                return candidate.resolve()
+        except OSError:
+            continue
+    return candidates[0].resolve() if candidates else None
+
+
 def generate_watermark_preview(
     upload_id: str,
     sheet_name: str,
@@ -182,27 +265,18 @@ def generate_watermark_preview(
     upload_dir = source_path.parent
     preview_name = f"watermark_preview_{uuid4().hex[:8]}.png"
     preview_path = (upload_dir / preview_name).resolve()
-    temp_copy = (upload_dir / f"preview_workbook_{uuid4().hex[:8]}{source_path.suffix}").resolve()
-    shutil.copy2(source_path, temp_copy)
-    try:
-        result = generate_preview_with_com(temp_copy, sheet_name, range_type, options, preview_path, prefer_wps=False)
-    except ProcessingError as exc:
-        if should_try_wps_preview(str(exc)):
-            try:
-                result = generate_preview_with_com(temp_copy, sheet_name, range_type, options, preview_path, prefer_wps=True)
-                result.setdefault("warnings", []).insert(0, "Excel COM 无法处理该文件，已自动切换 WPS COM 真实截图。")
-            except ProcessingError as wps_exc:
-                result = generate_preview_with_openpyxl(source_path, sheet_name, range_type, options, preview_path)
-                result.setdefault("warnings", []).extend([str(exc), str(wps_exc), "当前为近似绘制模式，复杂图表、图片、形状和排版可能无法完整保留。建议启用 Excel/WPS COM 截图能力。"])
-        else:
-            result = generate_preview_with_openpyxl(source_path, sheet_name, range_type, options, preview_path)
-            result.setdefault("warnings", []).extend([str(exc), "当前为近似绘制模式，复杂图表、图片、形状和排版可能无法完整保留。建议启用 Excel/WPS COM 截图能力。"])
-    finally:
-        if temp_copy.exists():
-            try:
-                temp_copy.unlink()
-            except OSError:
-                pass
+    result = capture_sheet_to_png(
+        source_path,
+        sheet_name,
+        range_type,
+        preview_path,
+        options,
+        temp_dir=upload_dir,
+        allow_fallback=options.allow_approximate_fallback,
+        prefer_silent=False,
+    )
+    if not preview_path.exists() or preview_path.stat().st_size == 0:
+        raise ProcessingError("预览图片生成失败，请重新生成预览图。")
     if result.get("warnings"):
         deduped_warnings = []
         for warning in result["warnings"]:
@@ -256,7 +330,7 @@ def process_image_based_excel(source_path: Path, output_excel: Path, temp_dir: P
 
     for index, sheet_info in enumerate(target_sheets, start=1):
         sheet_name = sheet_info["name"]
-        report_progress(progress_callback, f"正在截图工作表：{sheet_name}", index, len(target_sheets))
+        report_progress(progress_callback, f"正在真实截图工作表：{sheet_name}", index, len(target_sheets))
         processed_sheets.append(sheet_name)
         output_sheet = workbook.create_sheet(title=sheet_name)
         output_sheet.sheet_view.showGridLines = False
@@ -270,7 +344,8 @@ def process_image_based_excel(source_path: Path, output_excel: Path, temp_dir: P
                 image_path,
                 temp_dir,
                 allow_com_capture,
-                prefer_silent=True,
+                prefer_silent=False,
+                allow_fallback=options.allow_approximate_fallback,
             )
             if image_result.get("preview_engine") == "openpyxl + Pillow" and any(
                 "截图预览" in warning or "CopyPicture" in warning for warning in image_result.get("warnings", [])
@@ -279,6 +354,7 @@ def process_image_based_excel(source_path: Path, output_excel: Path, temp_dir: P
             engines.add(image_result.get("preview_engine", "openpyxl + Pillow"))
             capture_methods.add(image_result.get("capture_method", "fallback_openpyxl"))
             warnings_list.extend(image_result.get("warnings", []))
+            report_progress(progress_callback, f"正在写入截图到 Excel：{sheet_name}", index, len(target_sheets))
             image = OpenpyxlImage(str(image_path))
             output_sheet.add_image(image, "A1")
             try:
@@ -290,7 +366,7 @@ def process_image_based_excel(source_path: Path, output_excel: Path, temp_dir: P
             if options.add_watermark:
                 watermark_sheets_count += 1
         except Exception as exc:
-            errors.append(f"{sheet_name}: {exc}")
+            raise ProcessingError(f"工作表“{sheet_name}”真实截图失败：{exc}") from exc
 
         if options.protect_sheets:
             protect_openpyxl_sheet(output_sheet, options.protection_password)
@@ -315,16 +391,22 @@ def process_image_based_excel(source_path: Path, output_excel: Path, temp_dir: P
 
     report_progress(progress_callback, "正在写入预览版 Excel...", len(target_sheets), len(target_sheets))
     workbook.save(output_excel)
+    report_progress(progress_callback, "正在检查图片插入结果...", len(target_sheets), len(target_sheets))
+    image_insert_check = validate_image_based_output(output_excel, processed_sheets)
+    if not image_insert_check["image_insert_check_passed"]:
+        missing = "、".join(image_insert_check["sheets_missing_images"]) or "未知工作表"
+        raise ProcessingError(f"图片化 Excel 导出自检失败，以下工作表没有插入截图图片：{missing}")
     shutil.rmtree(temp_dir, ignore_errors=True)
 
     engine = " / ".join(sorted(engines)) if engines else "openpyxl + Pillow"
     screenshot_engine = screenshot_engine_from_engines(engines)
     deduped_warnings = dedupe_texts(warnings_list)
     if screenshot_engine == "fallback_openpyxl" or "openpyxl + Pillow" in engines:
-        deduped_warnings.append("当前为近似绘制模式，复杂图表、图片、形状和排版可能无法完整保留。建议启用 Excel/WPS COM 截图能力。")
+        deduped_warnings.append(APPROXIMATE_FALLBACK_WARNING)
         deduped_warnings = dedupe_texts(deduped_warnings)
 
     visual_objects_preserved = True if screenshot_engine in {"Excel COM", "WPS COM"} and "openpyxl + Pillow" not in engines else "unknown"
+    used_approximate_fallback = screenshot_engine == "fallback_openpyxl" or "openpyxl + Pillow" in engines
     return {
         "preview_security_mode": "image_based",
         "preview_security_mode_label": "图片化防复制版 Excel",
@@ -350,12 +432,24 @@ def process_image_based_excel(source_path: Path, output_excel: Path, temp_dir: P
         "edit_protection_enabled": options.protect_sheets or options.protect_workbook_structure,
         "real_cell_data_removed": True,
         "formula_removed": True,
-        "copy_risk_level": "low",
+        "copy_risk_level": "high" if used_approximate_fallback else "low",
         "screenshot_engine": screenshot_engine,
         "screenshot_capture_methods": sorted(capture_methods),
         "images_preserved_in_screenshot": visual_objects_preserved,
         "charts_preserved_in_screenshot": visual_objects_preserved,
-        "risk_notice": "该文件已尽量转为图片化预览，不能直接复制单元格数据，但仍无法防止截图、拍照或 OCR 识别。",
+        "image_insert_check_passed": image_insert_check["image_insert_check_passed"],
+        "inserted_images_count": image_insert_check["inserted_images_count"],
+        "expected_sheets_count": image_insert_check["expected_sheets_count"],
+        "sheets_missing_images": image_insert_check["sheets_missing_images"],
+        "xlsx_media_count": image_insert_check["xlsx_media_count"],
+        "xlsx_drawings_count": image_insert_check["xlsx_drawings_count"],
+        "preview_and_export_same_engine": True,
+        "screenshot_function_shared": True,
+        "risk_notice": (
+            "当前为近似绘制，不建议交付客户。"
+            if used_approximate_fallback
+            else "该文件已尽量转为图片化预览，不能直接复制单元格数据，但仍无法防止截图、拍照或 OCR 识别。"
+        ),
         "processing_engine": engine,
         "warnings": dedupe_texts(
             ["图片化防复制版未执行公式转数值，因为最终文件只保留图片化预览，不保留原始公式和单元格数据。"]
@@ -374,27 +468,74 @@ def generate_sheet_image(
     temp_dir: Path,
     allow_com: bool = True,
     prefer_silent: bool = False,
+    allow_fallback: bool = False,
 ) -> dict:
-    if not allow_com:
-        return generate_preview_with_openpyxl(workbook_path, sheet_name, range_type, options, image_path)
+    return capture_sheet_to_png(
+        workbook_path,
+        sheet_name,
+        range_type,
+        image_path,
+        options,
+        temp_dir=temp_dir,
+        allow_fallback=allow_fallback,
+        prefer_silent=prefer_silent,
+        allow_com=allow_com,
+    )
 
+
+def capture_sheet_to_png(
+    workbook_path: Path,
+    sheet_name: str,
+    range_type: str,
+    output_png_path: Path,
+    options: ExcelPreviewOptions,
+    temp_dir: Path | None = None,
+    allow_fallback: bool = False,
+    prefer_silent: bool = False,
+    allow_com: bool = True,
+) -> dict:
+    if not allow_com and not allow_fallback:
+        raise ProcessingError(REAL_SCREENSHOT_FAILURE_MESSAGE)
+    workbook_path = Path(workbook_path).resolve()
+    output_png_path = Path(output_png_path).resolve()
+    output_png_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(temp_dir or output_png_path.parent).resolve()
+    temp_dir.mkdir(parents=True, exist_ok=True)
     temp_dir = Path(temp_dir).resolve()
-    image_path = Path(image_path).resolve()
     temp_copy = (temp_dir / f"sheet_capture_{uuid4().hex[:8]}{workbook_path.suffix}").resolve()
     shutil.copy2(workbook_path, temp_copy)
+    errors: list[str] = []
     try:
-        result = generate_preview_with_com(temp_copy, sheet_name, range_type, options, image_path, prefer_wps=False, prefer_silent=prefer_silent)
-    except ProcessingError as exc:
-        if should_try_wps_preview(str(exc)):
+        if allow_com:
             try:
-                result = generate_preview_with_com(temp_copy, sheet_name, range_type, options, image_path, prefer_wps=True, prefer_silent=prefer_silent)
+                result = generate_preview_with_com(temp_copy, sheet_name, range_type, options, output_png_path, prefer_wps=False, prefer_silent=prefer_silent)
+                ensure_png_created(output_png_path)
+                result["screenshot_function_shared"] = True
+                if result.get("warnings"):
+                    result["warnings"] = dedupe_texts(result["warnings"])
+                return result
+            except ProcessingError as exc:
+                errors.append(f"Excel COM：{exc}")
+            try:
+                result = generate_preview_with_com(temp_copy, sheet_name, range_type, options, output_png_path, prefer_wps=True, prefer_silent=prefer_silent)
+                ensure_png_created(output_png_path)
                 result.setdefault("warnings", []).insert(0, "Excel COM 无法处理该文件，已自动切换 WPS COM 真实截图。")
-            except ProcessingError as wps_exc:
-                result = generate_preview_with_openpyxl(workbook_path, sheet_name, range_type, options, image_path)
-                result.setdefault("warnings", []).extend([str(exc), str(wps_exc)])
-        else:
-            result = generate_preview_with_openpyxl(workbook_path, sheet_name, range_type, options, image_path)
-            result.setdefault("warnings", []).append(str(exc))
+                result["screenshot_function_shared"] = True
+                result["warnings"] = dedupe_texts(result.get("warnings", []))
+                return result
+            except ProcessingError as exc:
+                errors.append(f"WPS COM：{exc}")
+
+        if allow_fallback:
+            result = generate_preview_with_openpyxl(workbook_path, sheet_name, range_type, options, output_png_path)
+            ensure_png_created(output_png_path)
+            result.setdefault("warnings", []).extend(errors + [APPROXIMATE_FALLBACK_WARNING])
+            result["screenshot_function_shared"] = True
+            result["warnings"] = dedupe_texts(result.get("warnings", []))
+            return result
+
+        detail = "；".join(errors)
+        raise ProcessingError(f"{REAL_SCREENSHOT_FAILURE_MESSAGE} 失败详情：{detail}")
     finally:
         if temp_copy.exists():
             try:
@@ -402,9 +543,65 @@ def generate_sheet_image(
             except OSError:
                 pass
 
-    if result.get("warnings"):
-        result["warnings"] = dedupe_texts(result["warnings"])
-    return result
+
+def ensure_png_created(path: Path):
+    path = Path(path)
+    if not path.exists() or path.stat().st_size == 0:
+        raise ProcessingError("截图图片生成失败。")
+
+
+def validate_image_based_output(output_excel: Path, expected_sheet_names: list[str]) -> dict:
+    try:
+        from openpyxl import load_workbook
+    except Exception as exc:
+        raise ProcessingError(f"缺少 openpyxl，无法检查图片化 Excel 输出：{exc}") from exc
+
+    output_excel = Path(output_excel).resolve()
+    if not output_excel.exists() or output_excel.stat().st_size == 0:
+        raise ProcessingError("图片化 Excel 输出文件不存在。")
+
+    inserted_images_count = 0
+    sheets_missing_images: list[str] = []
+    workbook = load_workbook(output_excel, data_only=False)
+    try:
+        for sheet_name in expected_sheet_names:
+            if sheet_name not in workbook.sheetnames:
+                sheets_missing_images.append(sheet_name)
+                continue
+            sheet = workbook[sheet_name]
+            image_count = len(getattr(sheet, "_images", []))
+            inserted_images_count += image_count
+            if image_count < 1:
+                sheets_missing_images.append(sheet_name)
+    finally:
+        workbook.close()
+
+    media_count = 0
+    drawings_count = 0
+    try:
+        with ZipFile(output_excel) as archive:
+            names = archive.namelist()
+            media_count = len([name for name in names if name.startswith("xl/media/")])
+            drawings_count = len([name for name in names if name.startswith("xl/drawings/")])
+    except Exception as exc:
+        raise ProcessingError(f"无法检查图片化 Excel 内部图片结构：{exc}") from exc
+
+    expected_count = len(expected_sheet_names)
+    check_passed = (
+        expected_count > 0
+        and inserted_images_count >= expected_count
+        and not sheets_missing_images
+        and media_count > 0
+        and drawings_count > 0
+    )
+    return {
+        "image_insert_check_passed": check_passed,
+        "inserted_images_count": inserted_images_count,
+        "expected_sheets_count": expected_count,
+        "sheets_missing_images": sheets_missing_images,
+        "xlsx_media_count": media_count,
+        "xlsx_drawings_count": drawings_count,
+    }
 
 
 def process_with_com(output_excel: Path, options: ExcelPreviewOptions, prefer_wps: bool, progress_callback=None) -> dict:
@@ -430,13 +627,7 @@ def process_with_com(output_excel: Path, options: ExcelPreviewOptions, prefer_wp
         except Exception:
             pass
 
-        workbook = app.Workbooks.Open(
-            str(output_excel),
-            UpdateLinks=0,
-            ReadOnly=False,
-            IgnoreReadOnlyRecommended=True,
-            AddToMru=False,
-        )
+        workbook = open_com_workbook(app, output_excel, read_only=False)
         if options.convert_formulas:
             calculate_workbook(app)
 
@@ -964,17 +1155,8 @@ def generate_preview_with_com(
             app.EnableEvents = False
         except Exception:
             pass
-        workbook = app.Workbooks.Open(
-            str(workbook_path),
-            UpdateLinks=0,
-            ReadOnly=True,
-            IgnoreReadOnlyRecommended=True,
-            AddToMru=False,
-        )
-        try:
-            sheet = workbook.Worksheets(sheet_name)
-        except Exception as exc:
-            raise ProcessingError("当前工作表不存在。") from exc
+        workbook = open_com_workbook(app, workbook_path, read_only=True)
+        sheet = get_com_worksheet(workbook, sheet_name)
         sheet.Activate()
         target_range = preview_target_range(sheet, range_type)
         width = max(240.0, float(target_range.Width))
@@ -1045,6 +1227,46 @@ def generate_preview_with_com(
             except OSError:
                 pass
         pythoncom.CoUninitialize()
+
+
+def open_com_workbook(app, workbook_path: Path, read_only: bool):
+    workbook_path = Path(workbook_path).resolve()
+    filename = str(workbook_path)
+    attempts = [
+        lambda: app.Workbooks.Open(
+            filename,
+            UpdateLinks=0,
+            ReadOnly=read_only,
+            IgnoreReadOnlyRecommended=True,
+            AddToMru=False,
+        ),
+        lambda: app.Workbooks.Open(filename, 0, read_only),
+        lambda: app.Workbooks.Open(Filename=filename, ReadOnly=read_only),
+        lambda: app.Workbooks.Open(filename),
+    ]
+    last_error = None
+    for attempt in attempts:
+        try:
+            return attempt()
+        except Exception as exc:
+            last_error = exc
+    raise last_error
+
+
+def get_com_worksheet(workbook, sheet_name: str):
+    target = str(sheet_name).strip()
+    try:
+        count = int(workbook.Worksheets.Count)
+    except Exception as exc:
+        raise ProcessingError("无法读取工作表列表。") from exc
+    for index in range(1, count + 1):
+        try:
+            sheet = workbook.Worksheets(index)
+            if str(sheet.Name).strip() == target:
+                return sheet
+        except Exception:
+            continue
+    raise ProcessingError("当前工作表不存在。")
 
 
 def capture_range_with_clipboard(app, sheet, target_range, output_path: Path):
@@ -1159,10 +1381,45 @@ def preview_target_range(sheet, range_type: str):
         try:
             print_area = str(sheet.PageSetup.PrintArea or "")
             if print_area:
-                return sheet.Range(print_area)
+                return expand_range_to_visible_objects(sheet, sheet.Range(print_area))
         except Exception:
             pass
-    return sheet.UsedRange
+    return expand_range_to_visible_objects(sheet, sheet.UsedRange)
+
+
+def expand_range_to_visible_objects(sheet, base_range):
+    try:
+        min_row = int(base_range.Row)
+        min_col = int(base_range.Column)
+        max_row = min_row + int(base_range.Rows.Count) - 1
+        max_col = min_col + int(base_range.Columns.Count) - 1
+    except Exception:
+        return base_range
+
+    try:
+        shapes = sheet.Shapes
+        shape_count = int(shapes.Count)
+    except Exception:
+        shape_count = 0
+
+    for index in range(1, shape_count + 1):
+        try:
+            shape = shapes.Item(index)
+            if hasattr(shape, "Visible") and int(shape.Visible) == MSO_FALSE:
+                continue
+            top_left = shape.TopLeftCell
+            bottom_right = shape.BottomRightCell
+            min_row = min(min_row, int(top_left.Row))
+            min_col = min(min_col, int(top_left.Column))
+            max_row = max(max_row, int(bottom_right.Row))
+            max_col = max(max_col, int(bottom_right.Column))
+        except Exception:
+            continue
+
+    try:
+        return sheet.Range(sheet.Cells(min_row, min_col), sheet.Cells(max_row, max_col))
+    except Exception:
+        return base_range
 
 
 def generate_preview_with_openpyxl(
@@ -1211,7 +1468,7 @@ def generate_preview_with_openpyxl(
             "screenshot_engine": "fallback_openpyxl",
             "capture_method": "fallback_openpyxl",
             "range_type": range_type,
-            "warnings": ["当前为近似绘制模式，复杂图表、图片、形状和排版可能无法完整保留。建议启用 Excel/WPS COM 截图能力。"],
+            "warnings": [APPROXIMATE_FALLBACK_WARNING],
         }
     finally:
         wb.close()
@@ -1361,6 +1618,9 @@ def options_from_form(form) -> ExcelPreviewOptions:
     image_range_type = (form.get("image_range_type") or form.get("range_type") or "auto").strip()
     if image_range_type not in {"auto", "used_range", "print_area"}:
         image_range_type = "auto"
+    output_mode = (form.get("output_mode") or "desktop").strip()
+    if output_mode not in {"desktop", "app_output"}:
+        output_mode = "desktop"
     convert_formulas = parse_bool(form.get("convert_formulas"), True)
     if security_mode == "image_based":
         convert_formulas = False
@@ -1379,6 +1639,8 @@ def options_from_form(form) -> ExcelPreviewOptions:
         include_hidden_sheets=parse_bool(form.get("include_hidden_sheets"), False),
         preview_security_mode=security_mode,
         image_range_type=image_range_type,
+        allow_approximate_fallback=parse_bool(form.get("allow_approximate_fallback"), False),
+        output_mode=output_mode,
     )
 
 
