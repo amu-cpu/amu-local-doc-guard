@@ -244,6 +244,24 @@ p {
   padding: 8px 10px;
 }
 
+.check-table {
+  border-collapse: collapse;
+  margin-top: 12px;
+  width: 100%;
+}
+
+.check-table th,
+.check-table td {
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  text-align: left;
+}
+
+.check-table th {
+  background: #eef2f7;
+  font-weight: 700;
+}
+
 .excel-preview-panel {
   border-top: 1px solid var(--line);
   margin-top: 18px;

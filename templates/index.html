@@ -98,6 +98,8 @@
                 <div class="actions">
                   <button id="excelPreviewBtn" type="button" class="ghost" disabled>生成水印预览图</button>
                   <button id="excelRefreshPreviewBtn" type="button" class="ghost" disabled>刷新预览</button>
+                  <button id="excelFormulaCheckBtn" type="button" class="ghost" disabled>仅检查 Excel 公式错误</button>
+                  <button id="excelValueVersionBtn" type="button" class="ghost" disabled>从模型版生成客户交付值版</button>
                 </div>
                 <div id="excelPreviewStatus" class="hint"></div>
               </div>
@@ -124,6 +126,10 @@
               <div class="hint">
                 图片化防复制版依赖 Excel/WPS 真实截图能力。真实截图失败时，建议停止导出并修复环境，不建议使用近似绘制兜底，否则可能丢失图表、图片和原始排版。
               </div>
+              <label class="inline-check">
+                <input id="excelAutoFormulaCheck" type="checkbox" checked>
+                生成预览版前自动执行公式错误检查
+              </label>
               <label>
                 输出位置
                 <select id="excelOutputMode">
@@ -194,6 +200,8 @@
                 <label><input id="excelProtectSheets" type="checkbox" checked> 保护工作表</label>
                 <label><input id="excelProtectWorkbook" type="checkbox" checked> 保护工作簿结构</label>
                 <label><input id="excelIncludeHidden" type="checkbox"> 处理隐藏工作表</label>
+                <label><input id="excelCheckHiddenSheets" type="checkbox" checked disabled> 检查隐藏/veryHidden 工作表</label>
+                <label><input id="excelKeepHiddenSheetsForValue" type="checkbox"> 生成交付值版时保留隐藏/veryHidden 表</label>
               </div>
               <div id="excelFormulaModeHint" class="hint">图片化防复制版会直接截图当前显示效果，不需要公式转数值。</div>
               <div class="actions">
@@ -222,6 +230,7 @@
           </div>
         </section>
         <section id="excelErrors" class="errors" hidden></section>
+        <section id="excelFormulaCheckResults" class="results"></section>
         <section id="excelResults" class="results"></section>
       </section>
     </main>

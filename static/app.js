@@ -31,6 +31,7 @@ const excelAddWatermark = document.getElementById("excelAddWatermark");
 const excelProtectSheets = document.getElementById("excelProtectSheets");
 const excelProtectWorkbook = document.getElementById("excelProtectWorkbook");
 const excelIncludeHidden = document.getElementById("excelIncludeHidden");
+const excelKeepHiddenSheetsForValue = document.getElementById("excelKeepHiddenSheetsForValue");
 const excelFallbackMode = document.getElementById("excelFallbackMode");
 const excelOutputMode = document.getElementById("excelOutputMode");
 const excelOutputReportToDesktop = document.getElementById("excelOutputReportToDesktop");
@@ -40,6 +41,10 @@ const excelSheetSelect = document.getElementById("excelSheetSelect");
 const excelPreviewRange = document.getElementById("excelPreviewRange");
 const excelPreviewBtn = document.getElementById("excelPreviewBtn");
 const excelRefreshPreviewBtn = document.getElementById("excelRefreshPreviewBtn");
+const excelFormulaCheckBtn = document.getElementById("excelFormulaCheckBtn");
+const excelValueVersionBtn = document.getElementById("excelValueVersionBtn");
+const excelAutoFormulaCheck = document.getElementById("excelAutoFormulaCheck");
+const excelFormulaCheckResults = document.getElementById("excelFormulaCheckResults");
 const excelPreviewStatus = document.getElementById("excelPreviewStatus");
 const excelPreviewStage = document.getElementById("excelPreviewStage");
 const excelPreviewPlaceholder = document.getElementById("excelPreviewPlaceholder");
@@ -66,6 +71,7 @@ let selectedExcelFile = null;
 let excelUploadId = "";
 let excelUploadMeta = null;
 let excelSheets = [];
+let latestExcelFormulaCheck = null;
 let excelPreviewScale = 1;
 let jobs = [];
 let activeJob = null;
@@ -101,6 +107,8 @@ excelDropzone.addEventListener("drop", (event) => {
 });
 excelFileInput.addEventListener("change", () => setExcelFile(excelFileInput.files[0]));
 excelProcessBtn.addEventListener("click", processExcelFile);
+excelFormulaCheckBtn.addEventListener("click", () => runExcelFormulaCheck({ manual: true }));
+excelValueVersionBtn.addEventListener("click", () => generateExcelValueVersion());
 excelPreviewBtn.addEventListener("click", generateExcelWatermarkPreview);
 excelRefreshPreviewBtn.addEventListener("click", generateExcelWatermarkPreview);
 excelSheetSelect.addEventListener("change", () => {
@@ -240,6 +248,7 @@ function resetExcelUploadState() {
   excelUploadId = "";
   excelUploadMeta = null;
   excelSheets = [];
+  latestExcelFormulaCheck = null;
   excelSheetSelect.innerHTML = `<option value="">请先上传 Excel</option>`;
   excelSheetSelect.disabled = true;
   excelPreviewRange.disabled = true;
@@ -248,6 +257,7 @@ function resetExcelUploadState() {
   excelPreviewImage.removeAttribute("src");
   excelPreviewPlaceholder.hidden = false;
   excelResults.innerHTML = "";
+  excelFormulaCheckResults.innerHTML = "";
   setExcelPreviewButtonsEnabled(false);
   updateExcelActionState();
 }
@@ -306,6 +316,8 @@ function populateExcelSheetSelect() {
 function updateExcelActionState() {
   const ready = Boolean(excelUploadId && excelSheetSelect.value);
   excelProcessBtn.disabled = !excelUploadId;
+  excelFormulaCheckBtn.disabled = !excelUploadId;
+  excelValueVersionBtn.disabled = !excelUploadId;
   excelPreviewBtn.disabled = !ready;
   excelRefreshPreviewBtn.disabled = !ready;
 }
@@ -342,6 +354,15 @@ function buildExcelOptionsFormData() {
   return formData;
 }
 
+function buildExcelValueVersionFormData() {
+  const formData = new FormData();
+  formData.append("upload_id", excelUploadId);
+  formData.append("keep_hidden_sheets", excelKeepHiddenSheetsForValue && excelKeepHiddenSheetsForValue.checked ? "1" : "0");
+  formData.append("protection_password", excelProtectionPassword.value || "123456");
+  formData.append("publish_to_desktop", "1");
+  return formData;
+}
+
 function markExcelWatermarkDirty() {
   if (excelUploadId) {
     excelPreviewStatus.textContent = "参数已修改，请点击生成水印预览图查看效果。";
@@ -366,6 +387,23 @@ async function processExcelFile() {
     return;
   }
   const fileName = selectedExcelFile?.name || excelUploadMeta?.original_name || "Excel 文件";
+
+  if (excelAutoFormulaCheck.checked) {
+    try {
+      excelStatusText.textContent = "正在执行公式错误检查...";
+      const check = await runExcelFormulaCheck({ manual: false });
+      if (!check.passed) {
+        excelStatusText.textContent = "公式错误检查不通过，已停止生成预览版";
+        showExcelErrors([{ file: fileName, error: "公式错误检查不通过，不允许继续生成客户预览版。请先查看检查报告并修复 Excel。" }]);
+        return;
+      }
+    } catch (error) {
+      excelStatusText.textContent = "公式错误检查失败，已停止生成预览版";
+      showExcelErrors([{ file: fileName, error: error.message }]);
+      return;
+    }
+  }
+
   excelStatusText.textContent = "正在导出 Excel...";
   excelProcessBtn.textContent = "正在导出...";
   excelProcessBtn.disabled = true;
@@ -398,6 +436,206 @@ async function processExcelFile() {
   }
 }
 
+async function runExcelFormulaCheck({ manual = false } = {}) {
+  if (!excelUploadId) {
+    throw new Error("请先上传 Excel。");
+  }
+  const fileName = selectedExcelFile?.name || excelUploadMeta?.original_name || "Excel 文件";
+  excelFormulaCheckBtn.disabled = true;
+  excelFormulaCheckBtn.textContent = "正在检查...";
+  excelErrors.hidden = true;
+  excelErrors.innerHTML = "";
+  excelFormulaCheckResults.innerHTML = "";
+  if (manual) {
+    excelStatusText.textContent = "正在检查 Excel 公式错误...";
+  }
+
+  const formData = new FormData();
+  formData.append("upload_id", excelUploadId);
+  try {
+    const response = await fetch("/excel/formula-check", { method: "POST", body: formData });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "Excel 公式错误检查失败");
+    latestExcelFormulaCheck = payload.check;
+    renderExcelFormulaCheckResult(latestExcelFormulaCheck);
+    excelStatusText.textContent = latestExcelFormulaCheck.passed
+      ? "公式错误检查通过，可以继续生成预览版"
+      : "公式错误检查不通过";
+    return latestExcelFormulaCheck;
+  } catch (error) {
+    showExcelErrors([{ file: fileName, error: error.message }]);
+    throw error;
+  } finally {
+    excelFormulaCheckBtn.textContent = "仅检查 Excel 公式错误";
+    updateExcelActionState();
+  }
+}
+
+async function generateExcelValueVersion() {
+  if (!excelUploadId) {
+    showExcelErrors([{ file: "Excel 交付值版", error: "请先上传 Excel。"}]);
+    return;
+  }
+  const fileName = selectedExcelFile?.name || excelUploadMeta?.original_name || "Excel 文件";
+  excelValueVersionBtn.disabled = true;
+  excelValueVersionBtn.textContent = "正在生成...";
+  excelErrors.hidden = true;
+  excelErrors.innerHTML = "";
+  excelFormulaCheckResults.innerHTML = "";
+  excelResults.innerHTML = "";
+  excelStatusText.textContent = "正在生成模型版与客户交付值版...";
+
+  try {
+    const response = await fetch("/excel/value-version", { method: "POST", body: buildExcelValueVersionFormData() });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "客户交付值版生成失败");
+    await pollExcelValueVersionTask(payload.task_id);
+  } catch (error) {
+    showExcelErrors([{ file: fileName, error: error.message }]);
+    excelStatusText.textContent = "生成失败";
+  } finally {
+    excelValueVersionBtn.textContent = "从模型版生成客户交付值版";
+    updateExcelActionState();
+  }
+}
+
+function renderExcelFormulaCheckResult(check) {
+  const downloads = check.download_urls || {};
+  const jsonUrl = check.json_report_url || downloads.json || "";
+  const markdownUrl = check.markdown_report_url || downloads.markdown || "";
+  const errorCounts = check.error_counts || {};
+  const sheetRows = (check.sheet_summaries || [])
+    .filter((sheet) => sheet.total_errors || (sheet.error_counts && sheet.error_counts["#NAME?"]))
+    .map((sheet) => {
+      const nameCount = (sheet.error_counts && sheet.error_counts["#NAME?"]) || 0;
+      const otherCount = Object.entries(sheet.error_counts || {})
+        .filter(([key]) => key !== "#NAME?")
+        .reduce((sum, [, value]) => sum + Number(value || 0), 0);
+      return `<tr><td>${escapeHtml(sheet.sheet_name)}</td><td>${nameCount}</td><td>${otherCount}</td><td>${sheet.total_errors || 0}</td></tr>`;
+    })
+    .join("");
+  const typicalCells = (check.error_locations || []).slice(0, 12)
+    .map((item) => `${item.sheet_name}!${item.cell} ${item.error_value}`)
+    .join("；");
+  const keywordCount = (check.internal_keyword_hits || []).length;
+  const resultText = check.passed
+    ? "公式错误检查通过，可以继续生成预览版"
+    : "公式错误检查不通过，不允许继续生成客户预览版";
+
+  excelFormulaCheckResults.innerHTML = `
+    <section class="job">
+      <div class="job-header">
+        <div>
+          <div class="job-title">Excel 交付前质检 / 公式错误扫描</div>
+          <div class="job-meta">${escapeHtml(resultText)}</div>
+          <div class="job-meta">报告路径：${escapeHtml(check.markdown_report_path || check.json_report_path || "")}</div>
+        </div>
+        <div class="download-row">
+          ${jsonUrl ? `<a href="${jsonUrl}" download>下载 JSON 报告</a>` : ""}
+          ${markdownUrl ? `<a href="${markdownUrl}" download>下载 Markdown 报告</a>` : ""}
+        </div>
+      </div>
+      <div class="excel-result-grid">
+        <div>错误总数：${check.total_error_count || 0}</div>
+        <div>#NAME?：${errorCounts["#NAME?"] || 0}</div>
+        <div>其他公式错误：${Math.max(0, (check.total_error_count || 0) - (errorCounts["#NAME?"] || 0))}</div>
+        <div>工作表总数：${check.worksheet_total_count || 0}</div>
+        <div>可见表：${check.visible_sheet_count || 0}</div>
+        <div>隐藏/veryHidden 表：${check.hidden_sheet_count || 0}</div>
+        <div>内部痕迹关键词命中：${keywordCount}</div>
+        <div>外部链接：${(check.external_links || []).length}</div>
+      </div>
+      <div class="job-meta">典型单元格：${typicalCells ? escapeHtml(typicalCells) : "无"}</div>
+      ${sheetRows ? `
+        <table class="check-table">
+          <thead><tr><th>错误表名</th><th>#NAME?</th><th>其他错误</th><th>合计</th></tr></thead>
+          <tbody>${sheetRows}</tbody>
+        </table>
+      ` : ""}
+    </section>
+  `;
+}
+
+function renderExcelValueVersionResult(job) {
+  const downloads = job.download_urls || {};
+  const modelUrl = job.model_download_url || downloads.model || "";
+  const valueUrl = job.value_download_url || downloads.value || "";
+  const jsonUrl = job.json_report_url || downloads.json || "";
+  const markdownUrl = job.markdown_report_url || downloads.markdown || "";
+  const sourceCheck = job.source_model_check || {};
+  const deliveryCheck = job.delivery_value_check || {};
+  const sourceNameErrors = (sourceCheck.error_counts && sourceCheck.error_counts["#NAME?"]) || 0;
+  const sourceOtherErrors = Math.max(0, (sourceCheck.total_error_count || 0) - sourceNameErrors);
+  const deliveryNameErrors = (deliveryCheck.error_counts && deliveryCheck.error_counts["#NAME?"]) || 0;
+  const deliveryOtherErrors = Math.max(0, (deliveryCheck.total_error_count || 0) - deliveryNameErrors);
+  const sourceTypicalCells = (sourceCheck.error_locations || []).slice(0, 8)
+    .map((item) => `${item.sheet_name}!${item.cell} ${item.error_value}`)
+    .join("；");
+  const deliveryTypicalCells = (deliveryCheck.error_locations || []).slice(0, 8)
+    .map((item) => `${item.sheet_name}!${item.cell} ${item.error_value}`)
+    .join("；");
+  const blockingIssues = (job.blocking_issues || []).map((item) => `${item.item}=${item.count}`).join("；");
+  const sourceNameBySheet = sourceCheck.name_error_count_by_sheet || {};
+  const deliveryNameBySheet = deliveryCheck.name_error_count_by_sheet || {};
+  const sourceNameBySheetText = Object.keys(sourceNameBySheet).length
+    ? Object.entries(sourceNameBySheet).map(([sheet, count]) => `${sheet}=${count}`).join("；")
+    : "无";
+  const deliveryNameBySheetText = Object.keys(deliveryNameBySheet).length
+    ? Object.entries(deliveryNameBySheet).map(([sheet, count]) => `${sheet}=${count}`).join("；")
+    : "无";
+  const modelSavePath = job.model_version_published_path || job.model_desktop_path || job.model_version_path || "";
+  const valueSavePath = job.delivery_value_published_path || job.delivery_value_desktop_path || job.delivery_value_path || "";
+  const reportSavePath = job.markdown_report_published_path || job.markdown_report_desktop_path || job.markdown_report_path || job.json_report_published_path || job.json_report_path || "";
+  const appOutputPath = job.app_output_dir || "";
+  const desktopMessage = job.desktop_output_message ? `<div class="job-meta">${escapeHtml(job.desktop_output_message)}</div>` : "";
+
+  excelFormulaCheckResults.innerHTML = `
+    <section class="job">
+      <div class="job-header">
+        <div>
+          <div class="job-title">模型版与客户交付值版生成结果</div>
+          <div class="job-meta">最终结论：${escapeHtml(job.final_conclusion || (job.delivery_ready ? "通过" : "不通过"))}</div>
+          <div class="job-meta">源文件：${escapeHtml(job.source_file || "")}</div>
+          <div class="job-meta">模型版：${escapeHtml(job.model_version_file || "")}</div>
+          <div class="job-meta">客户交付值版：${escapeHtml(job.delivery_value_file || "")}</div>
+          ${modelSavePath ? `<div class="job-meta">模型版保存位置：${escapeHtml(modelSavePath)}</div>` : ""}
+          ${valueSavePath ? `<div class="job-meta">客户交付值版保存位置：${escapeHtml(valueSavePath)}</div>` : ""}
+          ${reportSavePath ? `<div class="job-meta">报告保存位置：${escapeHtml(reportSavePath)}</div>` : ""}
+          ${appOutputPath ? `<div class="job-meta">程序备份目录：${escapeHtml(appOutputPath)}</div>` : ""}
+        </div>
+        <div class="download-row">
+          ${modelUrl ? `<a href="${modelUrl}" download>下载模型版</a>` : ""}
+          ${valueUrl ? `<a href="${valueUrl}" download>下载客户交付值版</a>` : ""}
+          ${jsonUrl ? `<a href="${jsonUrl}" download>下载 JSON 报告</a>` : ""}
+          ${markdownUrl ? `<a href="${markdownUrl}" download>下载 Markdown 报告</a>` : ""}
+        </div>
+      </div>
+      <div class="excel-result-grid">
+        <div>是否可用于交付：${job.delivery_ready ? "可用于交付" : "不通过"}</div>
+        <div>工作表总数：${deliveryCheck.worksheet_total_count || 0}</div>
+        <div>可见表：${deliveryCheck.visible_sheet_count || 0}</div>
+        <div>隐藏/veryHidden 表：${deliveryCheck.hidden_sheet_count || 0}</div>
+        <div>公式单元格：${deliveryCheck.formula_cells_count || 0}</div>
+        <div>#NAME?：${deliveryNameErrors}</div>
+        <div>其他公式错误：${deliveryOtherErrors}</div>
+        <div>内部痕迹关键词：${(deliveryCheck.internal_keyword_hits || []).length}</div>
+        <div>外部链接：${(deliveryCheck.external_links || []).length}</div>
+        <div>无效命名区域：${(deliveryCheck.defined_name_issues || []).length}</div>
+      </div>
+      <div class="job-meta">源模型版检查：#NAME? ${sourceNameErrors}，其他错误 ${sourceOtherErrors}，各表命中 ${escapeHtml(sourceNameBySheetText)}</div>
+      <div class="job-meta">交付值版复检：#NAME? ${deliveryNameErrors}，其他错误 ${deliveryOtherErrors}，各表命中 ${escapeHtml(deliveryNameBySheetText)}</div>
+      <div class="job-meta">源模型版典型单元格：${sourceTypicalCells ? escapeHtml(sourceTypicalCells) : "无"}</div>
+      <div class="job-meta">交付值版典型单元格：${deliveryTypicalCells ? escapeHtml(deliveryTypicalCells) : "无"}</div>
+      <div class="job-meta">典型阻断项：${blockingIssues ? escapeHtml(blockingIssues) : "无"}</div>
+      ${desktopMessage}
+      ${job.delivery_ready
+        ? `<div class="warning">公式错误检查通过，可以继续生成预览版</div>`
+        : `<div class="conversion-warning">公式错误未清零，不建议交付</div>`
+      }
+    </section>
+  `;
+}
+
 async function pollExcelExportTask(taskId) {
   while (true) {
     const response = await fetch(`/excel/export-status/${encodeURIComponent(taskId)}`);
@@ -415,6 +653,28 @@ async function pollExcelExportTask(taskId) {
     }
     if (payload.state === "error") {
       throw new Error(payload.message || "Excel 导出失败");
+    }
+    await wait(800);
+  }
+}
+
+async function pollExcelValueVersionTask(taskId) {
+  while (true) {
+    const response = await fetch(`/excel/value-version-status/${encodeURIComponent(taskId)}`);
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "读取客户交付值版进度失败");
+    if (payload.current && payload.total) {
+      excelStatusText.textContent = `${payload.message || "正在处理"}（${payload.current} / ${payload.total}）`;
+    } else {
+      excelStatusText.textContent = payload.message || "正在生成客户交付值版...";
+    }
+    if (payload.state === "done") {
+      renderExcelValueVersionResult(payload.job);
+      excelStatusText.textContent = payload.job.delivery_ready ? "客户交付值版已生成，可用于交付" : "客户交付值版生成完成，但未通过复检";
+      return;
+    }
+    if (payload.state === "error") {
+      throw new Error(payload.message || "客户交付值版生成失败");
     }
     await wait(800);
   }

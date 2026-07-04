@@ -123,6 +123,18 @@ Excel 客户预览版提供两种预览安全模式：
 
 如果只是给客户看样式、结构和大概内容，优先使用“图片化防复制版 Excel”。
 
+## 财务 Excel 值版
+
+如果要做财务 Excel 的“模型版 + 客户交付值版”，网页里先点“仅检查 Excel 公式错误”，通过后再点“从模型版生成客户交付值版”。
+
+默认会把最终文件复制到桌面，最容易找；如果是给 Codex 直接跑路径流程，用：
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\excel_value_version_cli.py --excel-path "C:\完整\路径\原文件.xlsx"
+```
+
+它会直接在原文件同目录只输出两个 Excel：模型版、客户交付值版。JSON 和 Markdown 质检报告会放到工具自己的 `output` 目录，不放进原文件目录。
+
 ## 真实测试文档
 
 真实 Word/PDF 测试文件建议放在 `private_samples` 目录，或从任意本地目录直接拖入网页。

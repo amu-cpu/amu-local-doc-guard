@@ -16,6 +16,7 @@ from desensitizer.excel_preview import (
     process_excel_preview,
     process_excel_preview_from_upload,
 )
+from desensitizer.excel_formula_check import check_excel_upload_formulas
 from desensitizer.processor import (
     OUTPUT_ROOT,
     ProcessingError,
@@ -26,6 +27,7 @@ from desensitizer.processor import (
     reprocess_existing_job,
     undo_last_manual_redaction,
 )
+from desensitizer.excel_value_version import generate_value_version_from_upload
 
 
 app = Flask(__name__)
@@ -62,6 +64,42 @@ def with_excel_urls(report: dict) -> dict:
         decorated["excel_download_url"] = url_for("output_file", name=f"{job_id}/{outputs['excel']}")
     if outputs.get("report"):
         decorated["report_download_url"] = url_for("output_file", name=f"{job_id}/{outputs['report']}")
+    return decorated
+
+
+def with_formula_check_urls(report: dict) -> dict:
+    decorated = copy.deepcopy(report)
+    job_id = decorated["job_id"]
+    outputs = decorated.get("outputs", {})
+    decorated["download_urls"] = {
+        key: url_for("output_file", name=f"{job_id}/{value}")
+        for key, value in outputs.items()
+        if key in {"json", "markdown"} and value
+    }
+    if outputs.get("json"):
+        decorated["json_report_url"] = url_for("output_file", name=f"{job_id}/{outputs['json']}")
+    if outputs.get("markdown"):
+        decorated["markdown_report_url"] = url_for("output_file", name=f"{job_id}/{outputs['markdown']}")
+    return decorated
+
+
+def with_excel_value_version_urls(report: dict) -> dict:
+    decorated = copy.deepcopy(report)
+    job_id = decorated["job_id"]
+    outputs = decorated.get("outputs", {})
+    decorated["download_urls"] = {
+        key: url_for("output_file", name=f"{job_id}/{value}")
+        for key, value in outputs.items()
+        if key in {"model", "value", "json", "markdown"} and value
+    }
+    if outputs.get("model"):
+        decorated["model_download_url"] = url_for("output_file", name=f"{job_id}/{outputs['model']}")
+    if outputs.get("value"):
+        decorated["value_download_url"] = url_for("output_file", name=f"{job_id}/{outputs['value']}")
+    if outputs.get("json"):
+        decorated["json_report_url"] = url_for("output_file", name=f"{job_id}/{outputs['json']}")
+    if outputs.get("markdown"):
+        decorated["markdown_report_url"] = url_for("output_file", name=f"{job_id}/{outputs['markdown']}")
     return decorated
 
 
@@ -202,6 +240,93 @@ def excel_inspect():
     except Exception as exc:
         return jsonify({"error": f"读取 Excel 工作表失败：{exc}"}), 500
     return jsonify({"upload": upload})
+
+
+@app.post("/excel/formula-check")
+def excel_formula_check():
+    upload_id = (request.form.get("upload_id") or "").strip()
+    if not upload_id:
+        return jsonify({"error": "当前文件不存在，请重新上传 Excel。"}), 400
+    try:
+        report = check_excel_upload_formulas(upload_id, OUTPUT_ROOT)
+    except ProcessingError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": f"Excel 公式错误检查失败：{exc}"}), 500
+    return jsonify({"check": with_formula_check_urls(report)})
+
+
+@app.post("/excel/value-version")
+def start_excel_value_version():
+    upload_id = (request.form.get("upload_id") or "").strip()
+    if not upload_id:
+        return jsonify({"error": "当前文件不存在，请重新上传 Excel。"}), 400
+    keep_hidden_sheets = request.form.get("keep_hidden_sheets") == "1"
+    protection_password = request.form.get("protection_password") or "123456"
+    publish_to_desktop = request.form.get("publish_to_desktop", "1") != "0"
+
+    task_id = uuid4().hex
+    task = {
+        "task_id": task_id,
+        "state": "queued",
+        "message": "准备生成客户交付值版...",
+        "current": 0,
+        "total": None,
+        "kind": "excel_value_version",
+    }
+    with TASK_LOCK:
+        TASKS[task_id] = task
+    TASK_EXECUTOR.submit(
+        run_excel_value_version_task,
+        task_id,
+        upload_id,
+        keep_hidden_sheets,
+        protection_password,
+        publish_to_desktop,
+    )
+    return jsonify({"task_id": task_id})
+
+
+@app.get("/excel/value-version-status/<task_id>")
+def excel_value_version_status(task_id: str):
+    with TASK_LOCK:
+        task = copy.deepcopy(TASKS.get(task_id))
+    if not task:
+        return jsonify({"error": "任务不存在。"}), 404
+    if task.get("state") == "done" and task.get("report"):
+        task["job"] = with_excel_value_version_urls(task["report"])
+        task.pop("report", None)
+    return jsonify(task)
+
+
+def run_excel_value_version_task(task_id: str, upload_id: str, keep_hidden_sheets: bool, protection_password: str, publish_to_desktop: bool = True):
+    def progress(message: str, current: int | None = None, total: int | None = None):
+        with TASK_LOCK:
+            task = TASKS.get(task_id)
+            if not task:
+                return
+            task["state"] = "running"
+            task["message"] = message
+            if current is not None:
+                task["current"] = current
+            if total is not None:
+                task["total"] = total
+
+    try:
+        progress("正在后台生成客户交付值版...", 0, None)
+        report = generate_value_version_from_upload(
+            upload_id,
+            OUTPUT_ROOT,
+            keep_hidden_sheets=keep_hidden_sheets,
+            protection_password=protection_password,
+            publish_to_desktop=publish_to_desktop,
+            progress_callback=progress,
+        )
+        with TASK_LOCK:
+            TASKS[task_id].update({"state": "done", "message": "客户交付值版生成完成", "report": report})
+    except Exception as exc:
+        with TASK_LOCK:
+            TASKS[task_id].update({"state": "error", "message": f"客户交付值版生成失败：{exc}"})
 
 
 @app.post("/excel/watermark-preview")
